@@ -359,15 +359,16 @@ class GRPOTrainer:
         policy_losses = []
         
         for i, completion in enumerate(group.completions):
-            # Recompute log prob under current policy (returns tensor of per-token log probs)
+            # Recompute log prob under current policy WITH gradients
             new_log_prob_tensor = self.policy.compute_log_prob(
                 group.prompt,
-                completion.response
+                completion.response,
+                require_grad=True  # Need gradients for backprop
             )
             # Sum to get total log probability (scalar)
             new_log_prob = new_log_prob_tensor.sum()
             
-            # old_log_probs[i] is already a scalar (total log prob)
+            # old_log_probs[i] is already a scalar (total log prob) - no grad needed
             old_log_prob = torch.tensor(old_log_probs[i], device=new_log_prob.device)
             
             # Compute ratio (in log space, then exp)
@@ -384,7 +385,7 @@ class GRPOTrainer:
             
             loss = policy_loss + self.beta * kl_penalty
             total_loss += loss
-            policy_losses.append(policy_loss.item())
+            policy_losses.append(policy_loss.detach().item())
         
         # Average loss over group
         total_loss = total_loss / self.group_size

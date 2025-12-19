@@ -332,13 +332,15 @@ class LLMPolicy:
     def compute_log_prob(
         self,
         prompt: str,
-        response: str
+        response: str,
+        require_grad: bool = False
     ) -> torch.Tensor:
         """Compute log probability of response given prompt.
         
         Args:
             prompt: Input prompt
             response: Generated response
+            require_grad: Whether to track gradients (True for training updates)
             
         Returns:
             Log probability tensor
@@ -356,9 +358,15 @@ class LLMPolicy:
         prompt_ids = self.tokenizer(prompt, return_tensors="pt")['input_ids']
         prompt_len = prompt_ids.shape[1]
         
-        with torch.no_grad():
+        if require_grad:
+            # With gradients for policy update
             outputs = self.model(**inputs)
             logits = outputs.logits
+        else:
+            # Without gradients for inference
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+                logits = outputs.logits
         
         # Get log probs for response tokens only
         log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
@@ -371,7 +379,7 @@ class LLMPolicy:
         
         if response_log_probs:
             return torch.stack(response_log_probs)
-        return torch.tensor([0.0])
+        return torch.tensor([0.0], device=self.model.device, requires_grad=require_grad)
     
     def save(self, path: str):
         """Save model weights.
