@@ -1,0 +1,48 @@
+{
+  "pr_id": "PR-002",
+  "title": "Add is_palindrome function to strings module",
+  "description": "Implement a function to check if a string is a palindrome. Should ignore case and non-alphanumeric characters.",
+  "author": "dev-bob",
+  "difficulty": 2,
+  "depends_on": ["PR-001"],
+  "labels": ["enhancement"],
+  "files_changed": ["pyutils/strings.py"],
+  "base_commit": "def5678",
+  "expected_tools": [
+    {"tool": "read_file", "args": {"path": "pyutils/strings.py"}},
+    {"tool": "edit_file", "args": {"path": "pyutils/strings.py", "content": "..."}}
+  ],
+  "expected_changes": {
+    "pyutils/strings.py": {
+      "action": "modify",
+      "additions": [
+        "",
+        "",
+        "def is_palindrome(s: str) -> bool:",
+        "    \"\"\"Check if a string is a palindrome.",
+        "    ",
+        "    Ignores case and non-alphanumeric characters.",
+        "    ",
+        "    Args:",
+        "        s: Input string to check",
+        "        ",
+        "    Returns:",
+        "        True if palindrome, False otherwise",
+        "    \"\"\"",
+        "    cleaned = ''.join(c.lower() for c in s if c.isalnum())",
+        "    return cleaned == cleaned[::-1]"
+      ]
+    }
+  },
+  "test_cases": [
+    {"input": "racecar", "expected": true},
+    {"input": "A man a plan a canal Panama", "expected": true},
+    {"input": "hello", "expected": false},
+    {"input": "", "expected": true}
+  ],
+  "success_criteria": {
+    "must_compile": true,
+    "tests_must_pass": true,
+    "exact_match_bonus": true
+  }
+}

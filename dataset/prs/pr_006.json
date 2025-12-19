@@ -1,0 +1,57 @@
+{
+  "pr_id": "PR-006",
+  "title": "Add phone number validator to validators module",
+  "description": "Add a function to validate US phone numbers. Should accept formats: (123) 456-7890, 123-456-7890, 123.456.7890, 1234567890",
+  "author": "dev-frank",
+  "difficulty": 4,
+  "labels": ["enhancement"],
+  "files_changed": ["pyutils/validators.py"],
+  "base_commit": "pqr1234",
+  "expected_tools": [
+    {"tool": "read_file", "args": {"path": "pyutils/validators.py"}},
+    {"tool": "edit_file", "args": {"path": "pyutils/validators.py", "content": "..."}}
+  ],
+  "expected_changes": {
+    "pyutils/validators.py": {
+      "action": "modify",
+      "additions": [
+        "",
+        "",
+        "def is_valid_phone(phone: str) -> bool:",
+        "    \"\"\"Validate US phone number format.",
+        "    ",
+        "    Accepts formats:",
+        "    - (123) 456-7890",
+        "    - 123-456-7890", 
+        "    - 123.456.7890",
+        "    - 1234567890",
+        "    ",
+        "    Args:",
+        "        phone: Phone number string to validate",
+        "        ",
+        "    Returns:",
+        "        True if valid US phone format",
+        "    \"\"\"",
+        "    patterns = [",
+        "        r'^\\(\\d{3}\\)\\s?\\d{3}-\\d{4}$',",
+        "        r'^\\d{3}-\\d{3}-\\d{4}$',",
+        "        r'^\\d{3}\\.\\d{3}\\.\\d{4}$',",
+        "        r'^\\d{10}$'",
+        "    ]",
+        "    return any(re.match(p, phone) for p in patterns)"
+      ]
+    }
+  },
+  "test_cases": [
+    {"input": "(123) 456-7890", "expected": true},
+    {"input": "123-456-7890", "expected": true},
+    {"input": "123.456.7890", "expected": true},
+    {"input": "1234567890", "expected": true},
+    {"input": "123-45-6789", "expected": false}
+  ],
+  "success_criteria": {
+    "must_compile": true,
+    "tests_must_pass": true,
+    "exact_match_bonus": true
+  }
+}

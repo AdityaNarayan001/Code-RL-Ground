@@ -1,0 +1,51 @@
+{
+  "pr_id": "PR-007",
+  "title": "Add chunk function to collections module",
+  "description": "Add a function that splits a list into chunks of specified size. The last chunk may be smaller if the list doesn't divide evenly.",
+  "author": "dev-grace",
+  "difficulty": 2,
+  "depends_on": ["PR-005"],
+  "labels": ["enhancement"],
+  "files_changed": ["pyutils/collections.py"],
+  "base_commit": "stu5678",
+  "expected_tools": [
+    {"tool": "read_file", "args": {"path": "pyutils/collections.py"}},
+    {"tool": "edit_file", "args": {"path": "pyutils/collections.py", "content": "..."}}
+  ],
+  "expected_changes": {
+    "pyutils/collections.py": {
+      "action": "modify", 
+      "additions": [
+        "",
+        "",
+        "def chunk(items: List[Any], size: int) -> List[List[Any]]:",
+        "    \"\"\"Split a list into chunks of specified size.",
+        "    ",
+        "    Args:",
+        "        items: List to split",
+        "        size: Maximum size of each chunk",
+        "        ",
+        "    Returns:",
+        "        List of chunks",
+        "        ",
+        "    Raises:",
+        "        ValueError: If size is less than 1",
+        "    \"\"\"",
+        "    if size < 1:",
+        "        raise ValueError(\"Chunk size must be at least 1\")",
+        "    return [items[i:i + size] for i in range(0, len(items), size)]"
+      ]
+    }
+  },
+  "test_cases": [
+    {"input": [[1, 2, 3, 4, 5], 2], "expected": [[1, 2], [3, 4], [5]]},
+    {"input": [[1, 2, 3], 3], "expected": [[1, 2, 3]]},
+    {"input": [[], 2], "expected": []},
+    {"input": [[1, 2], 0], "expected": "ValueError"}
+  ],
+  "success_criteria": {
+    "must_compile": true,
+    "tests_must_pass": true,
+    "exact_match_bonus": true
+  }
+}

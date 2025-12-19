@@ -1,0 +1,67 @@
+{
+  "pr_id": "PR-009",
+  "title": "Add memoization decorator to new decorators module",
+  "description": "Create a new decorators.py module with a memoize decorator that caches function results based on arguments. Should work with any hashable arguments.",
+  "author": "dev-iris",
+  "difficulty": 5,
+  "labels": ["enhancement", "new-module"],
+  "files_changed": ["pyutils/decorators.py", "pyutils/__init__.py"],
+  "base_commit": "yza3456",
+  "expected_tools": [
+    {"tool": "read_file", "args": {"path": "pyutils/__init__.py"}},
+    {"tool": "create_file", "args": {"path": "pyutils/decorators.py", "content": "..."}},
+    {"tool": "edit_file", "args": {"path": "pyutils/__init__.py", "content": "..."}}
+  ],
+  "expected_changes": {
+    "pyutils/decorators.py": {
+      "action": "create",
+      "content": [
+        "\"\"\"Decorator utilities.\"\"\"",
+        "",
+        "from functools import wraps",
+        "from typing import Callable, Any",
+        "",
+        "",
+        "def memoize(func: Callable) -> Callable:",
+        "    \"\"\"Decorator to cache function results.",
+        "    ",
+        "    Caches results based on function arguments.",
+        "    Arguments must be hashable.",
+        "    ",
+        "    Args:",
+        "        func: Function to memoize",
+        "        ",
+        "    Returns:",
+        "        Memoized function",
+        "    \"\"\"",
+        "    cache = {}",
+        "    ",
+        "    @wraps(func)",
+        "    def wrapper(*args, **kwargs):",
+        "        key = (args, tuple(sorted(kwargs.items())))",
+        "        if key not in cache:",
+        "            cache[key] = func(*args, **kwargs)",
+        "        return cache[key]",
+        "    ",
+        "    wrapper.cache = cache",
+        "    wrapper.clear_cache = lambda: cache.clear()",
+        "    return wrapper"
+      ]
+    },
+    "pyutils/__init__.py": {
+      "action": "modify",
+      "additions": [
+        "from .decorators import memoize"
+      ]
+    }
+  },
+  "test_cases": [
+    {"description": "memoize caches results", "test_code": "@memoize\ndef add(a, b): return a + b\nassert add(1, 2) == 3\nassert len(add.cache) == 1"},
+    {"description": "memoize returns cached value", "test_code": "call_count = 0\n@memoize\ndef inc(): global call_count; call_count += 1; return call_count\ninc(); inc()\nassert call_count == 1"}
+  ],
+  "success_criteria": {
+    "must_compile": true,
+    "tests_must_pass": true,
+    "exact_match_bonus": true
+  }
+}

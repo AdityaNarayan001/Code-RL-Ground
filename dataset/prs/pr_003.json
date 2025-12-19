@@ -1,0 +1,54 @@
+{
+  "pr_id": "PR-003",
+  "title": "Add fibonacci function to numbers module",
+  "description": "Add a function to compute the nth Fibonacci number. Should handle edge cases for n=0 and n=1. Use iterative approach for efficiency.",
+  "author": "dev-charlie",
+  "difficulty": 2,
+  "labels": ["enhancement"],
+  "files_changed": ["pyutils/numbers.py"],
+  "base_commit": "ghi9012",
+  "expected_tools": [
+    {"tool": "read_file", "args": {"path": "pyutils/numbers.py"}},
+    {"tool": "edit_file", "args": {"path": "pyutils/numbers.py", "content": "..."}}
+  ],
+  "expected_changes": {
+    "pyutils/numbers.py": {
+      "action": "modify",
+      "additions": [
+        "",
+        "",
+        "def fibonacci(n: int) -> int:",
+        "    \"\"\"Compute the nth Fibonacci number.",
+        "    ",
+        "    Args:",
+        "        n: Index in Fibonacci sequence (0-indexed)",
+        "        ",
+        "    Returns:",
+        "        The nth Fibonacci number",
+        "        ",
+        "    Raises:",
+        "        ValueError: If n is negative",
+        "    \"\"\"",
+        "    if n < 0:",
+        "        raise ValueError(\"n must be non-negative\")",
+        "    if n <= 1:",
+        "        return n",
+        "    a, b = 0, 1",
+        "    for _ in range(2, n + 1):",
+        "        a, b = b, a + b",
+        "    return b"
+      ]
+    }
+  },
+  "test_cases": [
+    {"input": 0, "expected": 0},
+    {"input": 1, "expected": 1},
+    {"input": 10, "expected": 55},
+    {"input": -1, "expected": "ValueError"}
+  ],
+  "success_criteria": {
+    "must_compile": true,
+    "tests_must_pass": true,
+    "exact_match_bonus": true
+  }
+}

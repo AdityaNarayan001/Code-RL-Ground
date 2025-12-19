@@ -1,0 +1,60 @@
+{
+  "pr_id": "PR-008",
+  "title": "Add file extension utilities to files module",
+  "description": "Add functions to get file extension and change file extension. get_extension should return extension without dot, change_extension should replace the extension.",
+  "author": "dev-henry",
+  "difficulty": 3,
+  "labels": ["enhancement"],
+  "files_changed": ["pyutils/files.py"],
+  "base_commit": "vwx9012",
+  "expected_tools": [
+    {"tool": "read_file", "args": {"path": "pyutils/files.py"}},
+    {"tool": "edit_file", "args": {"path": "pyutils/files.py", "content": "..."}}
+  ],
+  "expected_changes": {
+    "pyutils/files.py": {
+      "action": "modify",
+      "additions": [
+        "",
+        "",
+        "def get_extension(filepath: str) -> str:",
+        "    \"\"\"Get file extension without the dot.",
+        "    ",
+        "    Args:",
+        "        filepath: Path to file",
+        "        ",
+        "    Returns:",
+        "        File extension without dot, empty string if none",
+        "    \"\"\"",
+        "    ext = Path(filepath).suffix",
+        "    return ext[1:] if ext else ''",
+        "",
+        "",
+        "def change_extension(filepath: str, new_ext: str) -> str:",
+        "    \"\"\"Change file extension.",
+        "    ",
+        "    Args:",
+        "        filepath: Original file path",
+        "        new_ext: New extension (with or without dot)",
+        "        ",
+        "    Returns:",
+        "        File path with new extension",
+        "    \"\"\"",
+        "    if not new_ext.startswith('.'):",
+        "        new_ext = '.' + new_ext",
+        "    return str(Path(filepath).with_suffix(new_ext))"
+      ]
+    }
+  },
+  "test_cases": [
+    {"function": "get_extension", "input": "file.txt", "expected": "txt"},
+    {"function": "get_extension", "input": "file", "expected": ""},
+    {"function": "change_extension", "input": ["file.txt", "md"], "expected": "file.md"},
+    {"function": "change_extension", "input": ["file.txt", ".py"], "expected": "file.py"}
+  ],
+  "success_criteria": {
+    "must_compile": true,
+    "tests_must_pass": true,
+    "exact_match_bonus": true
+  }
+}

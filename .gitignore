@@ -1,0 +1,35 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Checkpoints and cache
+checkpoints/
+cache/
+*.pt
+*.safetensors
+
+# Logs
+logs/
+*.log
+
+# Node
+ui/node_modules/
+ui/build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Hugging Face
+.cache/

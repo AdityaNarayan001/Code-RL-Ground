@@ -1,0 +1,50 @@
+{
+  "pr_id": "PR-005",
+  "title": "Add deep_flatten function to collections module",
+  "description": "The current flatten function only flattens one level. Add a deep_flatten function that recursively flattens arbitrarily nested lists.",
+  "author": "dev-eve",
+  "difficulty": 3,
+  "labels": ["enhancement"],
+  "files_changed": ["pyutils/collections.py"],
+  "base_commit": "mno7890",
+  "expected_tools": [
+    {"tool": "read_file", "args": {"path": "pyutils/collections.py"}},
+    {"tool": "edit_file", "args": {"path": "pyutils/collections.py", "content": "..."}}
+  ],
+  "expected_changes": {
+    "pyutils/collections.py": {
+      "action": "modify",
+      "additions": [
+        "",
+        "",
+        "def deep_flatten(nested_list: List) -> List:",
+        "    \"\"\"Recursively flatten a deeply nested list.",
+        "    ",
+        "    Args:",
+        "        nested_list: Arbitrarily nested list",
+        "        ",
+        "    Returns:",
+        "        Fully flattened list",
+        "    \"\"\"",
+        "    result = []",
+        "    for item in nested_list:",
+        "        if isinstance(item, list):",
+        "            result.extend(deep_flatten(item))",
+        "        else:",
+        "            result.append(item)",
+        "    return result"
+      ]
+    }
+  },
+  "test_cases": [
+    {"input": [[1, 2], [3, [4, 5]]], "expected": [1, 2, 3, 4, 5]},
+    {"input": [1, [2, [3, [4]]]], "expected": [1, 2, 3, 4]},
+    {"input": [], "expected": []},
+    {"input": [1, 2, 3], "expected": [1, 2, 3]}
+  ],
+  "success_criteria": {
+    "must_compile": true,
+    "tests_must_pass": true,
+    "exact_match_bonus": true
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "dataset_name": "pyutils-prs",
+  "version": "1.0.0",
+  "description": "10 Pull Request tasks for the pyutils repository",
+  "created_at": "2025-12-19",
+  "total_prs": 10,
+  "difficulty_distribution": {
+    "1": 1,
+    "2": 3,
+    "3": 3,
+    "4": 1,
+    "5": 2
+  },
+  "dependency_graph": {
+    "PR-001": [],
+    "PR-002": ["PR-001"],
+    "PR-003": [],
+    "PR-004": ["PR-003"],
+    "PR-005": [],
+    "PR-006": [],
+    "PR-007": ["PR-005"],
+    "PR-008": [],
+    "PR-009": [],
+    "PR-010": ["PR-009"]
+  },
+  "prs": [
+    {"id": "PR-001", "file": "prs/pr_001.json", "difficulty": 1, "title": "Add count_vowels function", "module": "strings", "depends_on": []},
+    {"id": "PR-002", "file": "prs/pr_002.json", "difficulty": 2, "title": "Add is_palindrome function", "module": "strings", "depends_on": ["PR-001"]},
+    {"id": "PR-003", "file": "prs/pr_003.json", "difficulty": 2, "title": "Add fibonacci function", "module": "numbers", "depends_on": []},
+    {"id": "PR-004", "file": "prs/pr_004.json", "difficulty": 3, "title": "Add gcd and lcm functions", "module": "numbers", "depends_on": ["PR-003"]},
+    {"id": "PR-005", "file": "prs/pr_005.json", "difficulty": 3, "title": "Add deep_flatten function", "module": "collections", "depends_on": []},
+    {"id": "PR-006", "file": "prs/pr_006.json", "difficulty": 4, "title": "Add phone validator", "module": "validators", "depends_on": []},
+    {"id": "PR-007", "file": "prs/pr_007.json", "difficulty": 2, "title": "Add chunk function", "module": "collections", "depends_on": ["PR-005"]},
+    {"id": "PR-008", "file": "prs/pr_008.json", "difficulty": 3, "title": "Add file extension utilities", "module": "files", "depends_on": []},
+    {"id": "PR-009", "file": "prs/pr_009.json", "difficulty": 5, "title": "Add memoize decorator (new module)", "module": "decorators", "depends_on": []},
+    {"id": "PR-010", "file": "prs/pr_010.json", "difficulty": 5, "title": "Add retry decorator with backoff", "module": "decorators", "depends_on": ["PR-009"]}
+  ],
+  "curriculum_order": ["PR-001", "PR-003", "PR-005", "PR-006", "PR-008", "PR-009", "PR-002", "PR-004", "PR-007", "PR-010"],
+  "topological_order": ["PR-001", "PR-003", "PR-005", "PR-006", "PR-008", "PR-009", "PR-002", "PR-004", "PR-007", "PR-010"]
+}

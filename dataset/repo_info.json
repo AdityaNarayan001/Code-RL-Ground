@@ -1,0 +1,23 @@
+{
+  "repo_name": "pyutils",
+  "description": "A lightweight Python utility library for common operations",
+  "language": "python",
+  "version": "0.1.0",
+  "structure": {
+    "pyutils/": {
+      "__init__.py": "Package init",
+      "strings.py": "String manipulation utilities",
+      "numbers.py": "Number/math utilities",
+      "files.py": "File handling utilities",
+      "collections.py": "Collection helpers",
+      "validators.py": "Input validation functions"
+    },
+    "tests/": {
+      "test_strings.py": "String tests",
+      "test_numbers.py": "Number tests",
+      "test_files.py": "File tests"
+    },
+    "setup.py": "Package setup",
+    "README.md": "Documentation"
+  }
+}

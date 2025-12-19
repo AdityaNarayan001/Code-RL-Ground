@@ -1,0 +1,184 @@
+# Project Configuration
+project:
+  name: "code-rl-ground"
+  description: "RL-based code learning environment"
+  version: "0.1.0"
+
+# Paths (all relative to project root)
+paths:
+  dataset: "./dataset"
+  cache: "./cache"
+  checkpoints: "./checkpoints"
+  logs: "./logs"
+  ui_build: "./ui/build"
+
+# Model Configuration
+model:
+  name: "Qwen/Qwen2.5-3B"
+  backend: "transformers"  # transformers for HuggingFace/PyTorch
+  quantization: "4bit"  # 4bit, 8bit, or none (using bitsandbytes)
+  device: "mps"  # mps for M4 Mac, cuda for NVIDIA, cpu for fallback
+  max_context_length: 8192
+  generation:
+    max_new_tokens: 2048
+    temperature: 0.7
+    top_p: 0.95
+    do_sample: true
+
+# RL Training Configuration
+training:
+  algorithm: "grpo"  # ppo, grpo, reinforce
+  learning_rate: 1.0e-5
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  epochs_per_pr: 10
+  max_episodes: 1000
+  
+  # GRPO specific (Group Relative Policy Optimization)
+  grpo:
+    group_size: 4  # Number of completions per prompt
+    beta: 0.1  # KL penalty coefficient
+    clip_range: 0.2
+    
+  # PPO specific (legacy)
+  ppo:
+    clip_range: 0.2
+    value_loss_coef: 0.5
+    entropy_coef: 0.01
+    gamma: 0.99
+    gae_lambda: 0.95
+    
+  # LoRA configuration
+  lora:
+    enabled: true
+    r: 32
+    alpha: 64
+    dropout: 0.05
+    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+  # Checkpointing
+  checkpointing:
+    enabled: true
+    save_every_n_steps: 100
+    keep_last_n: 3  # Delete older checkpoints, keep only latest 3
+    save_optimizer: true
+    save_scheduler: true
+
+# Environment Configuration  
+environment:
+  mode: "single_turn"  # single_turn or multi_turn
+  max_turns: 5  # only used if mode is multi_turn
+  timeout_seconds: 60
+  
+  # Sandbox configuration (Python subprocess)
+  sandbox:
+    enabled: true
+    backend: "subprocess"  # subprocess (Python), docker (future)
+    timeout_per_execution: 30  # seconds
+    max_memory_mb: 512
+    allowed_imports: ["os", "sys", "re", "json", "math", "collections", "itertools", "functools", "pathlib", "typing", "time"]
+  
+  # Tool configuration (Option C - agent with tools)
+  tools:
+    enabled: true
+    available:
+      - read_file
+      - write_file
+      - edit_file
+      - list_directory
+      - run_python
+      - search_code
+      - submit
+
+  # Multi-turn feedback configuration
+  multi_turn_feedback:
+    show_correct_incorrect: true      # Just "correct/incorrect" signal
+    show_error_messages: true         # Detailed error messages (syntax, runtime)
+    show_partial_reward: true         # Show partial reward signal (0.0 - 1.0)
+    show_test_results: true           # Show which tests passed/failed
+    show_diff_hints: false            # Show hints about what's different (can be too revealing)
+
+# Reward Configuration
+rewards:
+  weights:
+    syntax_valid: 0.1
+    compiles: 0.2
+    tests_pass: 0.3
+    files_match: 0.2
+    exact_match: 0.2
+  
+  # Partial credit settings
+  partial_credit:
+    enabled: true
+    line_match_weight: 0.5
+    function_match_weight: 0.5
+
+# Curriculum Learning
+curriculum:
+  enabled: true
+  strategy: "dependency"  # dependency (respects PR deps), difficulty, random, sequential
+  respect_dependencies: true  # Always respect PR dependencies regardless of strategy
+  
+  # Strict progression: Must solve current PR before moving to next
+  strict_progression: true
+  solve_threshold: 0.9  # Reward threshold to consider PR "solved"
+  min_consecutive_solves: 3  # Must solve N times consecutively to confirm mastery
+  max_attempts_per_pr: 1000  # Max attempts before forcing move (safety valve)
+
+# Data Augmentation
+augmentation:
+  enabled: true
+  strategies:
+    - variable_renaming     # Change variable names (e.g., 's' -> 'text', 'n' -> 'num')
+    - docstring_variation   # Rephrase docstrings slightly
+    - whitespace_variation  # Minor formatting changes
+  multiplier: 3             # 3x more training examples per PR
+  seed: 42                  # For reproducibility
+
+# Mastery Evaluation
+mastery:
+  enabled: true
+  eval_frequency: 500  # Run mastery eval every N steps
+  full_eval_at_end: true  # Run full evaluation at training end
+  
+  # Mastery test: Can model recreate all PRs from scratch?
+  test_config:
+    num_attempts_per_pr: 5
+    require_all_prs: true
+    success_threshold_per_pr: 0.9  # 90% reward threshold to "pass"
+    overall_success_threshold: 1.0  # ALL PRs must pass for mastery
+
+# Championship Round (Final Test)
+championship:
+  enabled: true
+  trigger: "all_prs_solved"  # Run only after all PRs solved in training
+  mode: "sequential"  # Model does all PRs in sequence from base repo
+  allow_retries: false  # No retries in championship
+  save_transcript: true  # Save full transcript of championship attempt
+  
+# Model Saving
+model_saving:
+  save_final: true
+  final_model_path: "./checkpoints/final_model"
+  save_on_mastery: true  # Also save when mastery achieved
+  save_format: "safetensors"  # safetensors or pytorch
+
+# Logging & Monitoring
+logging:
+  level: "INFO"
+  save_generations: true
+  save_every_n_steps: 100
+  
+  # WebSocket for real-time UI
+  websocket:
+    enabled: true
+    host: "localhost"
+    port: 8765
+
+# UI Configuration
+ui:
+  enabled: true
+  host: "localhost"
+  port: 3000
+  api_port: 8000
+  refresh_rate_ms: 500

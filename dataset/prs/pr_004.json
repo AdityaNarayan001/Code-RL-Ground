@@ -1,0 +1,64 @@
+{
+  "pr_id": "PR-004",
+  "title": "Add gcd and lcm functions to numbers module",
+  "description": "Implement greatest common divisor (GCD) and least common multiple (LCM) functions. GCD should use Euclidean algorithm.",
+  "author": "dev-diana",
+  "difficulty": 3,
+  "depends_on": ["PR-003"],
+  "labels": ["enhancement"],
+  "files_changed": ["pyutils/numbers.py"],
+  "base_commit": "jkl3456",
+  "expected_tools": [
+    {"tool": "read_file", "args": {"path": "pyutils/numbers.py"}},
+    {"tool": "edit_file", "args": {"path": "pyutils/numbers.py", "content": "..."}}
+  ],
+  "expected_changes": {
+    "pyutils/numbers.py": {
+      "action": "modify",
+      "additions": [
+        "",
+        "",
+        "def gcd(a: int, b: int) -> int:",
+        "    \"\"\"Compute greatest common divisor using Euclidean algorithm.",
+        "    ",
+        "    Args:",
+        "        a: First integer",
+        "        b: Second integer",
+        "        ",
+        "    Returns:",
+        "        Greatest common divisor of a and b",
+        "    \"\"\"",
+        "    a, b = abs(a), abs(b)",
+        "    while b:",
+        "        a, b = b, a % b",
+        "    return a",
+        "",
+        "",
+        "def lcm(a: int, b: int) -> int:",
+        "    \"\"\"Compute least common multiple.",
+        "    ",
+        "    Args:",
+        "        a: First integer",
+        "        b: Second integer",
+        "        ",
+        "    Returns:",
+        "        Least common multiple of a and b",
+        "    \"\"\"",
+        "    if a == 0 or b == 0:",
+        "        return 0",
+        "    return abs(a * b) // gcd(a, b)"
+      ]
+    }
+  },
+  "test_cases": [
+    {"function": "gcd", "input": [12, 18], "expected": 6},
+    {"function": "gcd", "input": [17, 13], "expected": 1},
+    {"function": "lcm", "input": [4, 6], "expected": 12},
+    {"function": "lcm", "input": [0, 5], "expected": 0}
+  ],
+  "success_criteria": {
+    "must_compile": true,
+    "tests_must_pass": true,
+    "exact_match_bonus": true
+  }
+}

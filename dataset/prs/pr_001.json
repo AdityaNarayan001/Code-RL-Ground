@@ -1,0 +1,45 @@
+{
+  "pr_id": "PR-001",
+  "title": "Add count_vowels function to strings module",
+  "description": "We need a function that counts the number of vowels (a, e, i, o, u) in a given string. Should be case-insensitive.",
+  "author": "dev-alice",
+  "difficulty": 1,
+  "labels": ["enhancement", "good-first-issue"],
+  "files_changed": ["pyutils/strings.py"],
+  "base_commit": "abc1234",
+  "expected_tools": [
+    {"tool": "read_file", "args": {"path": "pyutils/strings.py"}},
+    {"tool": "edit_file", "args": {"path": "pyutils/strings.py", "content": "..."}}
+  ],
+  "expected_changes": {
+    "pyutils/strings.py": {
+      "action": "modify",
+      "additions": [
+        "",
+        "",
+        "def count_vowels(s: str) -> int:",
+        "    \"\"\"Count the number of vowels in a string.",
+        "    ",
+        "    Args:",
+        "        s: Input string",
+        "        ",
+        "    Returns:",
+        "        Number of vowels (a, e, i, o, u) in the string",
+        "    \"\"\"",
+        "    vowels = set('aeiouAEIOU')",
+        "    return sum(1 for char in s if char in vowels)"
+      ]
+    }
+  },
+  "test_cases": [
+    {"input": "hello", "expected": 2},
+    {"input": "AEIOU", "expected": 5},
+    {"input": "xyz", "expected": 0},
+    {"input": "", "expected": 0}
+  ],
+  "success_criteria": {
+    "must_compile": true,
+    "tests_must_pass": true,
+    "exact_match_bonus": true
+  }
+}
