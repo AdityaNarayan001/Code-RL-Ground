@@ -8,7 +8,8 @@ interface LiveGenerationProps {
 
 function LiveGeneration({ text, logs }: LiveGenerationProps) {
   const containerRef = useRef<HTMLDivElement>(null)
-  const [lastGeneration, setLastGeneration] = useState<WSMessage | null>(null)
+  const [lastComplete, setLastComplete] = useState<WSMessage | null>(null)
+  const [lastToken, setLastToken] = useState<WSMessage | null>(null)
   
   // Auto-scroll to bottom
   useEffect(() => {
@@ -17,13 +18,22 @@ function LiveGeneration({ text, logs }: LiveGenerationProps) {
     }
   }, [text, logs])
 
-  // Track latest generation for display
+  // Track latest generation events separately - scan backwards for efficiency
   useEffect(() => {
-    const latest = logs
-      .filter(l => l.type === 'generation_complete' || l.type === 'generation_token')
-      .slice(-1)[0]
-    if (latest) {
-      setLastGeneration(latest)
+    // Find latest generation_complete
+    for (let i = logs.length - 1; i >= 0; i--) {
+      if (logs[i].type === 'generation_complete') {
+        setLastComplete(logs[i])
+        break
+      }
+    }
+    
+    // Find latest generation_token
+    for (let i = logs.length - 1; i >= 0; i--) {
+      if (logs[i].type === 'generation_token') {
+        setLastToken(logs[i])
+        break
+      }
     }
   }, [logs])
 
@@ -34,13 +44,19 @@ function LiveGeneration({ text, logs }: LiveGenerationProps) {
 
   // Determine what to show
   const isStreaming = !!text
-  const displayText = text || lastGeneration?.full_text || ''
-  const currentPR = lastGeneration?.pr_id || ''
-  const currentEpisode = lastGeneration?.episode || lastGeneration?.turn || 0
-  const currentGroup = lastGeneration?.group_idx || 0
-  const numTurns = lastGeneration?.turns || 0
-  const episodeReward = lastGeneration?.reward
-  const episodeSolved = lastGeneration?.solved
+  const displayText = text || lastToken?.full_text || lastComplete?.full_text || ''
+  const currentPR = (isStreaming ? lastToken?.pr_id : lastComplete?.pr_id) || lastToken?.pr_id || lastComplete?.pr_id || ''
+  
+  // During streaming, show turn and group from the latest token
+  // After complete, show episode info from the latest complete
+  const currentTurn = lastToken?.turn || 0
+  const currentEpisode = lastComplete?.episode || 0
+  const currentGroup = isStreaming 
+    ? (lastToken?.group_idx || lastComplete?.group_idx || 0)
+    : (lastComplete?.group_idx || 0)
+  const numTurns = lastComplete?.turns || 0
+  const episodeReward = lastComplete?.reward
+  const episodeSolved = lastComplete?.solved
 
   return (
     <div className="h-full flex flex-col">
@@ -52,9 +68,14 @@ function LiveGeneration({ text, logs }: LiveGenerationProps) {
               {currentPR}
             </span>
           )}
-          {currentEpisode > 0 && (
+          {isStreaming && currentTurn > 0 && (
+            <span className="text-sm text-yellow-400">
+              Turn {currentTurn}/10 • Episode {currentGroup}/4
+            </span>
+          )}
+          {!isStreaming && currentEpisode > 0 && (
             <span className="text-sm text-gray-400">
-              Episode {currentEpisode}{currentGroup > 0 ? ` (${currentGroup}/4)` : ''}
+              Episode {currentEpisode} (Group {currentGroup}/4)
               {numTurns > 0 && ` • ${numTurns} turns`}
             </span>
           )}
@@ -103,7 +124,7 @@ function LiveGeneration({ text, logs }: LiveGenerationProps) {
                     </span>
                   </summary>
                   <pre className="px-4 py-2 text-xs text-gray-400 whitespace-pre-wrap max-h-40 overflow-auto">
-                    {log.full_text?.slice(0, 500)}{log.full_text?.length > 500 ? '...' : ''}
+                    {log.full_text?.slice(0, 500)}{(log.full_text?.length || 0) > 500 ? '...' : ''}
                   </pre>
                 </details>
               ))}

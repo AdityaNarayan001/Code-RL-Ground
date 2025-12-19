@@ -1,4 +1,4 @@
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Area, AreaChart, ReferenceLine } from 'recharts'
+import { Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Area, AreaChart, ReferenceLine } from 'recharts'
 import { EpisodeMetric } from '../types'
 
 interface RewardChartProps {
@@ -6,7 +6,7 @@ interface RewardChartProps {
   currentStep?: number
 }
 
-function RewardChart({ data, currentStep }: RewardChartProps) {
+function RewardChart({ data, currentStep: _currentStep }: RewardChartProps) {
   // Calculate moving average
   const windowSize = 10
   const chartData = data.map((point, i) => {

@@ -31,7 +31,7 @@ function App() {
   // Setup WebSocket connection
   useEffect(() => {
     let ws: WebSocket | null = null
-    let reconnectTimeout: NodeJS.Timeout | null = null
+    let reconnectTimeout: ReturnType<typeof setTimeout> | null = null
     let isMounted = true
     
     const connect = () => {
@@ -77,11 +77,15 @@ function App() {
             break
           case 'generation_complete':
             setGeneratingText('')
+            // Also refresh metrics and status
+            fetch('/api/metrics').then(r => r.json()).then(setMetrics).catch(() => {})
+            fetch('/api/status').then(r => r.json()).then(setStatus).catch(() => {})
             break
           case 'step':
           case 'episode':
-            // Refresh metrics
+            // Refresh metrics and status
             fetch('/api/metrics').then(r => r.json()).then(setMetrics).catch(() => {})
+            fetch('/api/status').then(r => r.json()).then(setStatus).catch(() => {})
             break
           case 'pr_solved':
             // Refresh PRs and status
@@ -121,11 +125,9 @@ function App() {
     }
   }, [fetchData])
 
-  // Initial data fetch
+  // Initial data fetch only (no polling - we use WebSocket for updates)
   useEffect(() => {
     fetchData()
-    const interval = setInterval(fetchData, 5000)
-    return () => clearInterval(interval)
   }, [fetchData])
 
   // Training control functions

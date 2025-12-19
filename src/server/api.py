@@ -283,7 +283,7 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
                     if len(state.recent_logs) > state.max_logs:
                         state.recent_logs.pop(0)
                     
-                    # Update training stats from step broadcasts
+                    # Update training stats from broadcasts
                     if data.get('type') == 'step':
                         metrics = data.get('metrics', {})
                         state.training_stats.update({
@@ -293,6 +293,16 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
                         })
                     elif data.get('type') == 'episode':
                         state.training_stats['total_episodes'] = data.get('episode', 0)
+                        state.training_stats['current_pr_id'] = data.get('pr_id')
+                        # Also update avg_reward from episodes
+                        reward = data.get('reward', 0)
+                        old_avg = state.training_stats.get('avg_reward', 0)
+                        episodes = state.training_stats.get('total_episodes', 1)
+                        # Running average
+                        state.training_stats['avg_reward'] = old_avg + (reward - old_avg) / max(1, episodes)
+                    elif data.get('type') == 'generation_complete':
+                        # Update current group info
+                        state.training_stats['current_group'] = data.get('group_idx', 0)
                         state.training_stats['current_pr_id'] = data.get('pr_id')
                     elif data.get('type') == 'pr_solved':
                         solved = state.training_stats.get('solved_prs', [])
