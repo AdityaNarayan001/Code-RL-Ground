@@ -235,7 +235,7 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
         
         # Run training in thread pool to avoid blocking
         def run_training_sync():
-            from ..agent import LLMPolicy, PPOTrainer
+            from ..agent import LLMPolicy, GRPOTrainer
             from ..environment import CodeEnv
             from ..data import PRLoader, CurriculumManager
             from ..utils.repo_state import RepoStateManager
@@ -267,32 +267,37 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
                 logger.info("Model loaded successfully!")
                 state.recent_logs.append({'type': 'info', 'message': 'LoRA ready!'})
                 
-                # Select trainer based on config
-                algorithm = state.config.training.algorithm
-                state.recent_logs.append({'type': 'info', 'message': f'Using {algorithm.upper()} algorithm'})
-                
-                if algorithm == "grpo":
-                    from ..agent import GRPOTrainer
-                    trainer = GRPOTrainer(
-                        config=state.config,
-                        policy=policy,
-                        env=env,
-                        pr_tasks=curriculum.get_remaining_tasks()
-                    )
-                else:
-                    trainer = PPOTrainer(
-                        config=state.config,
-                        policy=policy,
-                        env=env,
-                        pr_tasks=curriculum.get_remaining_tasks()
-                    )
+                # Create GRPO trainer
+                state.recent_logs.append({'type': 'info', 'message': 'Using GRPO algorithm'})
+                trainer = GRPOTrainer(
+                    config=state.config,
+                    policy=policy,
+                    env=env,
+                    pr_tasks=curriculum.get_remaining_tasks()
+                )
                 
                 # Set callback for updates
                 def thread_safe_broadcast(data: Dict[str, Any]):
                     state.recent_logs.append(data)
                     if len(state.recent_logs) > state.max_logs:
                         state.recent_logs.pop(0)
-                    # We'll poll these from the main loop
+                    
+                    # Update training stats from step broadcasts
+                    if data.get('type') == 'step':
+                        metrics = data.get('metrics', {})
+                        state.training_stats.update({
+                            'total_steps': data.get('step', 0),
+                            'avg_reward': metrics.get('avg_reward', metrics.get('mean_reward', 0)),
+                            'solve_rate': metrics.get('solve_rate', 0)
+                        })
+                    elif data.get('type') == 'episode':
+                        state.training_stats['total_episodes'] = data.get('episode', 0)
+                        state.training_stats['current_pr_id'] = data.get('pr_id')
+                    elif data.get('type') == 'pr_solved':
+                        solved = state.training_stats.get('solved_prs', [])
+                        if data.get('pr_id') not in solved:
+                            solved.append(data.get('pr_id'))
+                        state.training_stats['solved_prs'] = solved
                 
                 trainer.set_websocket_callback(thread_safe_broadcast)
                 
@@ -350,11 +355,17 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
         
         for log in state.recent_logs:
             if log.get('type') == 'step':
+                metrics = log.get('metrics', {})
                 steps.append({
                     'step': log.get('step', 0),
-                    'avg_reward': log.get('metrics', {}).get('avg_reward', 0),
-                    'solve_rate': log.get('metrics', {}).get('solve_rate', 0),
-                    'loss': log.get('metrics', {}).get('total_loss', 0)
+                    'avg_reward': metrics.get('avg_reward', metrics.get('mean_reward', 0)),
+                    'solve_rate': metrics.get('solve_rate', 0),
+                    'loss': metrics.get('loss', metrics.get('total_loss', 0)),
+                    'pg_loss': metrics.get('pg_loss', 0),
+                    'kl_loss': metrics.get('kl_loss', 0),
+                    'grad_norm': metrics.get('grad_norm', 0),
+                    'clip_frac': metrics.get('clip_frac', 0),
+                    'max_reward': metrics.get('max_reward', 0)
                 })
             elif log.get('type') == 'episode':
                 rewards.append({

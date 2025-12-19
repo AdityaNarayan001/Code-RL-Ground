@@ -10,7 +10,9 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
-    GenerationConfig
+    GenerationConfig,
+    LogitsProcessor,
+    LogitsProcessorList
 )
 from peft import (
     LoraConfig,
@@ -24,6 +26,21 @@ from ..utils.logging import get_logger
 
 
 logger = get_logger(__name__)
+
+
+class LogitClampProcessor(LogitsProcessor):
+    """Clamp logits to prevent inf/nan during sampling."""
+    
+    def __init__(self, min_val: float = -100.0, max_val: float = 100.0):
+        self.min_val = min_val
+        self.max_val = max_val
+    
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        # Clamp to reasonable range
+        scores = torch.clamp(scores, min=self.min_val, max=self.max_val)
+        # Replace any nan with 0
+        scores = torch.nan_to_num(scores, nan=0.0, posinf=self.max_val, neginf=self.min_val)
+        return scores
 
 
 @dataclass
@@ -216,24 +233,47 @@ class LLMPolicy:
         )
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
         
-        # Update generation config
+        # Use safe temperature (minimum 0.1 to avoid division issues)
+        safe_temp = max(temperature or self.generation_config.temperature, 0.1)
+        
+        # Update generation config with numerical stability safeguards
         gen_config = GenerationConfig(
             max_new_tokens=max_new_tokens or self.generation_config.max_new_tokens,
-            temperature=temperature or self.generation_config.temperature,
-            top_p=self.generation_config.top_p,
+            temperature=safe_temp,
+            top_p=min(self.generation_config.top_p, 0.95),  # Avoid top_p too close to 1
+            top_k=50,  # Add top_k to filter extreme values
             do_sample=self.generation_config.do_sample,
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.eos_token_id,
             output_scores=return_log_probs,
-            return_dict_in_generate=True
+            return_dict_in_generate=True,
+            renormalize_logits=True,  # Renormalize after filtering
         )
         
-        # Generate
+        # Logits processor for numerical stability
+        logits_processor = LogitsProcessorList([LogitClampProcessor()])
+        
+        # Generate with gradient disabled and autocast for stability
         with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                generation_config=gen_config
-            )
+            try:
+                outputs = self.model.generate(
+                    **inputs,
+                    generation_config=gen_config,
+                    logits_processor=logits_processor
+                )
+            except RuntimeError as e:
+                if "probability tensor" in str(e):
+                    # Fallback to greedy decoding if sampling fails
+                    logger.warning(f"Sampling failed, falling back to greedy: {e}")
+                    gen_config.do_sample = False
+                    gen_config.temperature = 1.0
+                    outputs = self.model.generate(
+                        **inputs,
+                        generation_config=gen_config,
+                        logits_processor=logits_processor
+                    )
+                else:
+                    raise
         
         # Decode
         generated_ids = outputs.sequences[0][inputs['input_ids'].shape[1]:]

@@ -1,23 +1,25 @@
-"""GRPO (Group Relative Policy Optimization) trainer for code generation RL.
+"""GRPO (Group Relative Policy Optimization) trainer - TinyZero-inspired implementation.
 
-GRPO is a simpler alternative to PPO that:
-1. Generates multiple completions per prompt (group)
-2. Uses relative ranking within the group for advantage estimation
-3. Doesn't require a separate value function/critic
+Based on veRL's GRPO implementation:
+1. Token-level log probabilities (not sequence sums)
+2. Group-relative advantage normalization  
+3. Masked loss computation on response tokens only
+4. Low-variance KL penalty
 """
 
-import logging
 import numpy as np
 import torch
 import torch.nn.functional as F
-from collections import deque
+from collections import deque, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
+import uuid
 
 from ..utils.config import Config
 from ..utils.logging import TrainingLogger, get_logger
+from ..utils.metrics import ExperimentLogger, create_experiment_logger
 from ..environment import CodeEnv
 from ..data import PRTask
 from .policy import LLMPolicy
@@ -26,36 +28,16 @@ logger = get_logger(__name__)
 
 
 @dataclass
-class CompletionData:
-    """Data for a single completion."""
-    prompt: str
-    response: str
-    reward: float
-    log_prob: float
+class RolloutData:
+    """Data from a single rollout."""
+    prompt_ids: torch.Tensor          # (prompt_len,)
+    response_ids: torch.Tensor        # (response_len,)
+    response_mask: torch.Tensor       # (response_len,) - 1 for valid tokens
+    old_log_probs: torch.Tensor       # (response_len,) - per-token log probs
+    reward: float                     # scalar outcome reward
     solved: bool
-
-
-@dataclass 
-class GroupData:
-    """Data for a group of completions from same prompt."""
-    prompt: str
-    completions: List[CompletionData]
-    
-    @property
-    def rewards(self) -> List[float]:
-        return [c.reward for c in self.completions]
-    
-    @property
-    def log_probs(self) -> List[float]:
-        return [c.log_prob for c in self.completions]
-    
-    @property
-    def advantages(self) -> List[float]:
-        """Compute relative advantages within group."""
-        rewards = np.array(self.rewards)
-        mean_reward = rewards.mean()
-        std_reward = rewards.std() + 1e-8
-        return ((rewards - mean_reward) / std_reward).tolist()
+    group_id: str                     # to group responses from same prompt
+    response_text: str                # for display
 
 
 @dataclass
@@ -84,13 +66,13 @@ class TrainingStats:
 
 
 class GRPOTrainer:
-    """GRPO trainer for code generation RL.
+    """GRPO trainer using TinyZero/veRL approach.
     
-    Implements Group Relative Policy Optimization:
-    - Generate K completions per prompt
-    - Rank by reward within group
-    - Use relative advantage for policy update
-    - No value function needed
+    Key differences from naive GRPO:
+    - Token-level log probs and advantages
+    - Masked mean for loss computation
+    - Group-relative advantage normalization
+    - Proper KL penalty handling
     """
     
     def __init__(
@@ -101,15 +83,6 @@ class GRPOTrainer:
         pr_tasks: List[PRTask],
         training_logger: Optional[TrainingLogger] = None
     ):
-        """Initialize GRPO trainer.
-        
-        Args:
-            config: Configuration
-            policy: LLM policy
-            env: Code environment
-            pr_tasks: PR tasks in curriculum order
-            training_logger: Training logger
-        """
         self.config = config
         self.policy = policy
         self.env = env
@@ -120,9 +93,9 @@ class GRPOTrainer:
         self.grpo_config = config.training.grpo
         self.curriculum_config = config.curriculum
         
-        # GRPO hyperparameters (access dataclass attributes directly)
+        # GRPO hyperparameters
         self.group_size = self.grpo_config.group_size
-        self.beta = self.grpo_config.beta  # KL penalty
+        self.beta = self.grpo_config.beta  # KL coefficient
         self.clip_range = self.grpo_config.clip_range
         self.learning_rate = self.train_config.learning_rate
         
@@ -135,7 +108,10 @@ class GRPOTrainer:
         # Stats
         self.stats = TrainingStats()
         
-        # Logger
+        # Sophisticated experiment logger
+        self.exp_logger: Optional[ExperimentLogger] = None
+        
+        # Legacy logger for backward compat
         self.logger = training_logger or TrainingLogger(config)
         
         # Checkpointing
@@ -144,10 +120,17 @@ class GRPOTrainer:
         
         # Callback
         self._ws_callback = None
+        
+        # Device
+        self.device = next(self.policy.model.parameters()).device
     
     def set_websocket_callback(self, callback):
         """Set callback for real-time updates."""
         self._ws_callback = callback
+        
+        # Create sophisticated logger with broadcast callback
+        self.exp_logger = create_experiment_logger(self.config, callback)
+        
         if hasattr(self.logger, 'set_websocket_callback'):
             self.logger.set_websocket_callback(callback)
     
@@ -157,14 +140,9 @@ class GRPOTrainer:
             self._ws_callback(data)
     
     def train(self) -> Dict[str, Any]:
-        """Run GRPO training loop.
-        
-        Returns:
-            Training results
-        """
-        logger.info("Starting GRPO training...")
-        logger.info(f"Group size: {self.group_size}")
-        logger.info(f"Beta (KL penalty): {self.beta}")
+        """Run GRPO training loop."""
+        logger.info("Starting GRPO training (TinyZero-style)...")
+        logger.info(f"Group size: {self.group_size}, Beta: {self.beta}, Clip: {self.clip_range}")
         logger.info(f"PRs to solve: {[t.pr_id for t in self.pr_tasks]}")
         
         self._broadcast({
@@ -185,130 +163,139 @@ class GRPOTrainer:
                 
                 # Train until solved
                 while not self._is_pr_solved(current_task.pr_id):
-                    # Collect group of completions
-                    group = self._collect_group(current_task)
+                    # Collect rollouts (group of completions)
+                    rollouts = self._collect_rollouts(current_task)
                     
-                    # GRPO update
-                    update_stats = self._grpo_update(group)
+                    # Compute group-relative advantages
+                    self._compute_advantages(rollouts)
                     
-                    # Log
-                    self._log_progress(group, update_stats)
+                    # GRPO policy update
+                    update_stats = self._grpo_update(rollouts)
+                    
+                    # Log progress
+                    self._log_progress(rollouts, update_stats)
                     
                     # Checkpoint
                     if self.stats.total_steps % self.train_config.checkpointing.save_every_n_steps == 0:
                         self._save_checkpoint()
-                    
-                    # Safety valve
-                    if self.stats.total_episodes > self.curriculum_config.max_attempts_per_pr * (self.stats.current_pr_idx + 1):
-                        logger.warning(f"Max attempts for {current_task.pr_id}, moving on")
-                        break
                 
-                # Mark solved and advance
-                if current_task.pr_id not in self.stats.solved_prs:
-                    self.stats.solved_prs.append(current_task.pr_id)
-                    self._broadcast({
-                        'type': 'pr_solved',
-                        'pr_id': current_task.pr_id
-                    })
-                
+                # PR solved - advance
+                self._broadcast({
+                    'type': 'pr_solved',
+                    'pr_id': current_task.pr_id,
+                    'attempts': self.stats.total_episodes
+                })
                 self.stats.current_pr_idx += 1
-                self.stats.consecutive_solves = 0
             
-            # Championship round
-            if self.config.championship.enabled:
-                self._run_championship()
+            # All PRs solved
+            self._broadcast({
+                'type': 'training_complete',
+                'result': {'stats': self.stats.to_dict()}
+            })
+            return {'stats': self.stats.to_dict()}
             
-            # Save final
-            if self.config.model_saving.save_final:
-                self._save_final_model()
-            
-            return {
-                'success': True,
-                'total_episodes': self.stats.total_episodes,
-                'solved_prs': self.stats.solved_prs,
-                'stats': self.stats.to_dict()
-            }
-            
-        except KeyboardInterrupt:
-            logger.info("Training interrupted")
-            self._save_checkpoint()
-            return {
-                'success': False,
-                'reason': 'interrupted',
-                'stats': self.stats.to_dict()
-            }
         except Exception as e:
             logger.error(f"Training error: {e}")
             import traceback
-            traceback.print_exc()
             self._broadcast({
-                'type': 'training_error',
-                'error': str(e)
+                'type': 'training_error', 
+                'error': str(e),
+                'traceback': traceback.format_exc()
             })
-            return {
-                'success': False,
-                'reason': str(e),
-                'stats': self.stats.to_dict()
-            }
+            raise
     
-    def _collect_group(self, task: PRTask) -> GroupData:
-        """Collect a group of completions for the same prompt.
+    def _collect_rollouts(self, task: PRTask) -> List[RolloutData]:
+        """Collect a group of rollouts for the given task.
         
-        Args:
-            task: Current PR task
-            
-        Returns:
-            Group data with multiple completions
+        Generates K completions, executes each in the environment,
+        and collects token-level log probs.
         """
-        completions = []
+        rollouts = []
+        group_id = str(uuid.uuid4())  # Same group ID for all completions from this prompt
         
-        # Reset env once to get the prompt
+        # Get prompt from environment
         obs = self.env.reset(task.data, task.depends_on)
-        prompt = obs.content
+        prompt_text = obs.content
         system_prompt = self._get_system_prompt()
+        
+        # Build full prompt with chat template
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt_text})
+        
+        if hasattr(self.policy.tokenizer, 'apply_chat_template'):
+            full_prompt = self.policy.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        else:
+            full_prompt = prompt_text
+        
+        # Tokenize prompt
+        prompt_encoding = self.policy.tokenizer(
+            full_prompt, return_tensors="pt", truncation=True
+        )
+        prompt_ids = prompt_encoding['input_ids'][0]
         
         # Generate K completions
         for i in range(self.group_size):
-            # Reset policy conversation
             self.policy.reset_conversation()
             
-            # Generate with different sampling
+            # Generate with varying temperature for diversity
+            temperature = 0.7 + 0.1 * i
             output = self.policy.generate(
-                prompt,
+                prompt_text,
                 system_prompt=system_prompt,
                 return_log_probs=True,
-                temperature=0.7 + 0.1 * i  # Vary temperature for diversity
+                temperature=temperature
             )
             
-            # Broadcast generation for UI display
+            # Broadcast for UI - use global episode count, not local index
             self._broadcast({
                 'type': 'generation_complete',
                 'pr_id': task.pr_id,
-                'turn': i + 1,
+                'turn': self.stats.total_episodes + 1,  # Running episode counter
+                'group_idx': i + 1,  # Which completion in this group (1-4)
                 'full_text': output.text
             })
             
-            # Execute in environment
+            # Get response tokens
+            response_ids = torch.tensor(output.token_ids, device=self.device)
+            response_len = len(output.token_ids)
+            
+            # Create response mask (all 1s for generated tokens)
+            response_mask = torch.ones(response_len, device=self.device)
+            
+            # Get per-token log probs from generation
+            # output.log_probs shape: (seq_len, vocab_size) or similar
+            if output.log_probs is not None and len(output.log_probs.shape) > 1:
+                # Gather log probs for the actual generated tokens
+                old_log_probs = self._gather_token_log_probs(
+                    output.log_probs, response_ids
+                )
+            else:
+                # Fallback: compute log probs
+                old_log_probs = self._compute_token_log_probs(
+                    prompt_ids, response_ids
+                )
+            
+            # Execute in environment to get reward
             self.env.reset(task.data, task.depends_on)
             action = self.env.parse_action(output.text)
             obs = self.env.step(action)
-            
-            # Get reward
             episode = self.env.get_episode()
-            reward = episode.total_reward
-            solved = episode.solved
+            reward = episode.total_reward if episode else 0.0
+            solved = episode.solved if episode else False
             
-            # Compute total log prob from log_probs tensor
-            total_log_prob = 0.0
-            if output.log_probs is not None:
-                total_log_prob = output.log_probs.sum().item()
-            
-            completions.append(CompletionData(
-                prompt=prompt,
-                response=output.text,
+            rollouts.append(RolloutData(
+                prompt_ids=prompt_ids.to(self.device),
+                response_ids=response_ids,
+                response_mask=response_mask,
+                old_log_probs=old_log_probs.detach(),
                 reward=reward,
-                log_prob=total_log_prob,
-                solved=solved
+                solved=solved,
+                group_id=group_id,
+                response_text=output.text
             ))
             
             # Update stats
@@ -324,250 +311,339 @@ class GRPOTrainer:
             else:
                 self.stats.consecutive_solves = 0
             
-            # Log episode
+            # Broadcast episode result
             self._broadcast({
                 'type': 'episode',
                 'episode': self.stats.total_episodes,
                 'pr_id': task.pr_id,
                 'reward': reward,
-                'solved': solved
+                'solved': solved,
+                'message': f'Episode {self.stats.total_episodes}: {task.pr_id} - R={reward:.2f}'
             })
-            
-            self.env.cleanup()
         
-        return GroupData(prompt=prompt, completions=completions)
+        return rollouts
     
-    def _grpo_update(self, group: GroupData) -> Dict[str, float]:
-        """Perform GRPO policy update.
-        
-        GRPO Loss = -E[advantage * log_prob] + beta * KL
-        
-        Where advantage is computed relative to group mean.
+    def _gather_token_log_probs(
+        self, 
+        log_probs: torch.Tensor, 
+        token_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Gather log probs for specific token IDs.
         
         Args:
-            group: Group of completions
+            log_probs: (seq_len, vocab_size) or (seq_len,) if already gathered
+            token_ids: (seq_len,) token IDs to gather
             
         Returns:
-            Update statistics
+            (seq_len,) tensor of log probs for each token
         """
+        if len(log_probs.shape) == 1:
+            return log_probs
+        
+        # Ensure tensors are on same device
+        log_probs = log_probs.to(self.device)
+        token_ids = token_ids.to(self.device)
+        
+        # Gather: for each position, get log prob of the actual token
+        seq_len = min(log_probs.shape[0], token_ids.shape[0])
+        gathered = torch.zeros(seq_len, device=self.device)
+        
+        for i in range(seq_len):
+            if i < log_probs.shape[0] and token_ids[i] < log_probs.shape[1]:
+                gathered[i] = log_probs[i, token_ids[i]]
+        
+        return gathered
+    
+    def _compute_token_log_probs(
+        self,
+        prompt_ids: torch.Tensor,
+        response_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute per-token log probs for a response given prompt.
+        
+        This is used when we don't have log probs from generation.
+        """
+        # Ensure both tensors are on the same device
+        prompt_ids = prompt_ids.to(self.device)
+        response_ids = response_ids.to(self.device)
+        
+        # Concatenate prompt and response
+        full_ids = torch.cat([prompt_ids, response_ids]).unsqueeze(0)
+        
+        with torch.no_grad():
+            outputs = self.policy.model(full_ids)
+            logits = outputs.logits[0]  # (seq_len, vocab_size)
+        
+        # Get log probs
+        log_probs = F.log_softmax(logits, dim=-1)
+        
+        # Extract log probs for response tokens
+        prompt_len = prompt_ids.shape[0]
+        response_log_probs = []
+        
+        for i in range(len(response_ids)):
+            # Log prob at position (prompt_len + i - 1) predicts token at (prompt_len + i)
+            if prompt_len + i - 1 >= 0 and prompt_len + i < full_ids.shape[1]:
+                token_id = response_ids[i]
+                lp = log_probs[prompt_len + i - 1, token_id]
+                response_log_probs.append(lp)
+        
+        if response_log_probs:
+            return torch.stack(response_log_probs)
+        return torch.zeros(1, device=self.device)
+    
+    def _compute_advantages(self, rollouts: List[RolloutData]) -> None:
+        """Compute group-relative advantages (in-place).
+        
+        Following TinyZero: normalize rewards within each group,
+        then spread the advantage to all tokens in the response.
+        """
+        # Group rollouts by group_id
+        groups = defaultdict(list)
+        for rollout in rollouts:
+            groups[rollout.group_id].append(rollout)
+        
+        # For each group, compute normalized advantages
+        for group_id, group_rollouts in groups.items():
+            rewards = torch.tensor([r.reward for r in group_rollouts], device=self.device)
+            
+            # Normalize within group
+            mean_reward = rewards.mean()
+            std_reward = rewards.std() + 1e-8
+            normalized = (rewards - mean_reward) / std_reward
+            
+            # Assign advantage to each rollout
+            # Store as attribute (will be used in update)
+            for i, rollout in enumerate(group_rollouts):
+                # Spread scalar advantage to all response tokens
+                rollout.advantage = normalized[i].item()
+    
+    def _grpo_update(self, rollouts: List[RolloutData]) -> Dict[str, float]:
+        """Perform GRPO policy update using token-level computation."""
         self.optimizer.zero_grad()
         
-        advantages = group.advantages
-        old_log_probs = group.log_probs
+        total_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+        total_pg_loss = 0.0
+        total_kl = 0.0
+        total_tokens = 0
+        clip_fracs = []
         
-        total_loss = 0.0
-        policy_losses = []
-        
-        for i, completion in enumerate(group.completions):
-            # Recompute log prob under current policy WITH gradients
-            new_log_prob_tensor = self.policy.compute_log_prob(
-                group.prompt,
-                completion.response,
-                require_grad=True  # Need gradients for backprop
+        for rollout in rollouts:
+            # Recompute log probs under current policy (with gradients)
+            new_log_probs = self._compute_token_log_probs_with_grad(
+                rollout.prompt_ids,
+                rollout.response_ids
             )
-            # Sum to get total log probability (scalar)
-            new_log_prob = new_log_prob_tensor.sum()
             
-            # old_log_probs[i] is already a scalar (total log prob) - no grad needed
-            old_log_prob = torch.tensor(old_log_probs[i], device=new_log_prob.device)
+            # Align lengths
+            min_len = min(new_log_probs.shape[0], rollout.old_log_probs.shape[0])
+            if min_len == 0:
+                continue
+                
+            new_lp = new_log_probs[:min_len]
+            old_lp = rollout.old_log_probs[:min_len].to(self.device)
+            mask = rollout.response_mask[:min_len].to(self.device)
             
-            # Compute ratio (in log space, then exp)
-            ratio = torch.exp(new_log_prob - old_log_prob)
+            # Compute ratio per token
+            ratio = torch.exp(new_lp - old_lp)
             
-            # Clipped objective (like PPO)
-            advantage = advantages[i]
+            # Advantage (same for all tokens in this response)
+            advantage = rollout.advantage
+            
+            # Clipped surrogate objective (per token)
             surr1 = ratio * advantage
             surr2 = torch.clamp(ratio, 1 - self.clip_range, 1 + self.clip_range) * advantage
-            policy_loss = -torch.min(surr1, surr2)
+            pg_loss_tokens = -torch.min(surr1, surr2)
             
-            # KL penalty (simplified - difference in log probs)
-            kl_penalty = (old_log_prob - new_log_prob).abs()
+            # Masked mean over tokens
+            pg_loss = (pg_loss_tokens * mask).sum() / (mask.sum() + 1e-8)
             
-            loss = policy_loss + self.beta * kl_penalty
-            total_loss += loss
-            policy_losses.append(policy_loss.detach().item())
+            # KL penalty (low-variance version from TinyZero)
+            # KL = old_lp - new_lp (approximation)
+            kl_tokens = old_lp - new_lp
+            kl_loss = (kl_tokens.abs() * mask).sum() / (mask.sum() + 1e-8)
+            
+            # Combined loss
+            loss = pg_loss + self.beta * kl_loss
+            total_loss = total_loss + loss
+            
+            # Stats
+            total_pg_loss += pg_loss.detach().item()
+            total_kl += kl_loss.detach().item()
+            total_tokens += mask.sum().item()
+            
+            # Clip fraction
+            clipped = (surr2 > surr1).float()
+            clip_fracs.append((clipped * mask).sum().item() / (mask.sum().item() + 1e-8))
         
-        # Average loss over group
-        total_loss = total_loss / self.group_size
+        # Average over rollouts
+        num_rollouts = len(rollouts)
+        if num_rollouts > 0:
+            total_loss = total_loss / num_rollouts
         
-        # Backward and step
+        # Backward
         total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.policy.model.parameters(), 1.0)
+        
+        # Gradient clipping
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.policy.model.parameters(), 1.0
+        )
+        
+        # Optimizer step
         self.optimizer.step()
         
         self.stats.total_steps += 1
         
         return {
-            'loss': total_loss.item(),
-            'mean_advantage': np.mean(advantages),
-            'mean_reward': np.mean(group.rewards),
-            'max_reward': np.max(group.rewards),
-            'solve_rate': sum(1 for c in group.completions if c.solved) / len(group.completions)
+            'loss': total_loss.detach().item(),
+            'pg_loss': total_pg_loss / max(num_rollouts, 1),
+            'kl_loss': total_kl / max(num_rollouts, 1),
+            'clip_frac': np.mean(clip_fracs) if clip_fracs else 0.0,
+            'grad_norm': grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
+            'mean_reward': np.mean([r.reward for r in rollouts]),
+            'max_reward': max(r.reward for r in rollouts),
+            'solve_rate': sum(1 for r in rollouts if r.solved) / len(rollouts)
         }
     
-    def _log_progress(self, group: GroupData, update_stats: Dict[str, float]):
-        """Log training progress."""
-        self._broadcast({
-            'type': 'step',
-            'step': self.stats.total_steps,
-            'metrics': {
-                'loss': update_stats['loss'],
-                'mean_reward': update_stats['mean_reward'],
-                'max_reward': update_stats['max_reward'],
-                'solve_rate': update_stats['solve_rate'],
-                'avg_reward': np.mean(list(self.stats.recent_rewards)) if self.stats.recent_rewards else 0
-            }
-        })
+    def _compute_token_log_probs_with_grad(
+        self,
+        prompt_ids: torch.Tensor,
+        response_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute per-token log probs WITH gradients for policy update."""
+        # Ensure both tensors are on the same device
+        prompt_ids = prompt_ids.to(self.device)
+        response_ids = response_ids.to(self.device)
         
-        if self.stats.total_steps % 10 == 0:
-            logger.info(
-                f"Step {self.stats.total_steps} | "
-                f"PR: {self.stats.current_pr_id} | "
-                f"Loss: {update_stats['loss']:.4f} | "
-                f"Mean R: {update_stats['mean_reward']:.3f} | "
-                f"Solve: {update_stats['solve_rate']:.1%}"
-            )
+        # Concatenate prompt and response
+        full_ids = torch.cat([prompt_ids, response_ids]).unsqueeze(0)
+        
+        # Forward pass (WITH gradients)
+        outputs = self.policy.model(full_ids)
+        logits = outputs.logits[0]  # (seq_len, vocab_size)
+        
+        # Get log probs
+        log_probs = F.log_softmax(logits, dim=-1)
+        
+        # Extract log probs for response tokens
+        prompt_len = prompt_ids.shape[0]
+        response_log_probs = []
+        
+        for i in range(len(response_ids)):
+            # Log prob at position (prompt_len + i - 1) predicts token at (prompt_len + i)
+            pos = prompt_len + i - 1
+            if pos >= 0 and pos < logits.shape[0]:
+                token_id = response_ids[i]
+                lp = log_probs[pos, token_id]
+                response_log_probs.append(lp)
+        
+        if response_log_probs:
+            return torch.stack(response_log_probs)
+        return torch.zeros(1, device=self.device, requires_grad=True)
     
     def _is_pr_solved(self, pr_id: str) -> bool:
-        """Check if PR meets solve criteria."""
-        if not self.curriculum_config.strict_progression:
+        """Check if PR is considered solved."""
+        if pr_id in self.stats.solved_prs:
             return True
         
-        best = self.stats.best_rewards.get(pr_id, 0)
-        consecutive = self.stats.consecutive_solves
+        best_reward = self.stats.best_rewards.get(pr_id, 0)
+        threshold = self.curriculum_config.solve_threshold
+        min_solves = self.curriculum_config.min_consecutive_solves
         
-        return (
-            best >= self.curriculum_config.solve_threshold and
-            consecutive >= self.curriculum_config.min_consecutive_solves
-        )
+        if best_reward >= threshold and self.stats.consecutive_solves >= min_solves:
+            self.stats.solved_prs.append(pr_id)
+            logger.info(f"PR {pr_id} solved! Best reward: {best_reward:.3f}")
+            return True
+        
+        return False
     
     def _get_system_prompt(self) -> str:
-        """Get system prompt for the agent."""
-        return """You are a code agent that solves programming tasks.
-You have access to tools to read, write, and execute code.
+        """Get system prompt for the agent with few-shot examples."""
+        return """You are a skilled software engineer. Your task is to implement the requested code changes.
 
-Available tools:
-- read_file(path): Read contents of a file
-- write_file(path, content): Write content to a file  
-- edit_file(path, old_text, new_text): Replace text in a file
-- run_python(code): Execute Python code
-- search_code(pattern): Search for pattern in codebase
-- submit(): Submit your solution
+IMPORTANT: You MUST use the exact tool format shown below. Do NOT use markdown code blocks.
 
-Respond with a tool call in this format:
-<tool>tool_name</tool>
-<args>{"arg": "value"}</args>
+## Tool Format
+<tool>tool_name(param="value")</tool>
 
-After making changes, use submit() to check if your solution is correct."""
+## Available Tools
+- read_file(path) - Read a file
+- write_file(path, content) - Write a new file  
+- edit_file(path, old_content, new_content) - Edit existing file
+- run_python(code) - Run Python code
+- submit() - Submit your solution
+
+## Example: Adding a function to a file
+
+1. First, read the file:
+<tool>read_file(path="utils/math.py")</tool>
+
+2. Then edit it to add new code:
+<tool>edit_file(path="utils/math.py", old_content="def add(a, b):\\n    return a + b", new_content="def add(a, b):\\n    return a + b\\n\\ndef multiply(a, b):\\n    return a * b")</tool>
+
+3. Submit when done:
+<tool>submit()</tool>
+
+Now complete the task using ONLY this exact <tool>...</tool> format. No explanations needed - just tool calls."""
+    
+    def _log_progress(self, rollouts: List[RolloutData], update_stats: Dict[str, float]):
+        """Log training progress using sophisticated logger."""
+        # Use experiment logger if available
+        if self.exp_logger:
+            self.exp_logger.log_step(
+                step=self.stats.total_steps,
+                loss=update_stats['loss'],
+                pg_loss=update_stats['pg_loss'],
+                kl_loss=update_stats['kl_loss'],
+                grad_norm=update_stats.get('grad_norm', 0),
+                clip_frac=update_stats['clip_frac'],
+                mean_reward=update_stats['mean_reward'],
+                max_reward=update_stats['max_reward'],
+                solve_rate=update_stats['solve_rate'],
+                num_episodes=len(rollouts)
+            )
+        else:
+            # Fallback to simple broadcast
+            self._broadcast({
+                'type': 'step',
+                'step': self.stats.total_steps,
+                'metrics': {
+                    'loss': update_stats['loss'],
+                    'pg_loss': update_stats['pg_loss'],
+                    'kl_loss': update_stats['kl_loss'],
+                    'clip_frac': update_stats['clip_frac'],
+                    'mean_reward': update_stats['mean_reward'],
+                    'max_reward': update_stats['max_reward'],
+                    'solve_rate': update_stats['solve_rate'],
+                    'avg_reward': np.mean(list(self.stats.recent_rewards)) if self.stats.recent_rewards else 0
+                }
+            })
+            
+            if self.stats.total_steps % 10 == 0:
+                logger.info(
+                    f"Step {self.stats.total_steps} | "
+                    f"PR: {self.stats.current_pr_id} | "
+                    f"Loss: {update_stats['loss']:.4f} | "
+                    f"Reward: {update_stats['mean_reward']:.3f} | "
+                    f"Solve: {update_stats['solve_rate']:.1%}"
+                )
     
     def _save_checkpoint(self):
         """Save training checkpoint."""
-        checkpoint_path = self.checkpoint_dir / f"checkpoint_step_{self.stats.total_steps}"
+        checkpoint_path = self.checkpoint_dir / f"step_{self.stats.total_steps}"
         checkpoint_path.mkdir(parents=True, exist_ok=True)
         
-        # Save LoRA weights
-        self.policy.model.save_pretrained(checkpoint_path / "lora")
+        # Save model
+        self.policy.save(str(checkpoint_path / "model"))
         
-        # Save training state
-        state = {
-            'stats': self.stats.to_dict(),
-            'optimizer': self.optimizer.state_dict(),
-        }
-        torch.save(state, checkpoint_path / "trainer_state.pt")
+        # Save stats
+        import json
+        with open(checkpoint_path / "stats.json", 'w') as f:
+            json.dump(self.stats.to_dict(), f, indent=2)
         
         logger.info(f"Checkpoint saved: {checkpoint_path}")
         self._broadcast({
             'type': 'checkpoint',
-            'step': self.stats.total_steps,
-            'path': str(checkpoint_path)
+            'path': str(checkpoint_path),
+            'step': self.stats.total_steps
         })
-        
-        # Cleanup old checkpoints
-        self._cleanup_old_checkpoints()
-    
-    def _cleanup_old_checkpoints(self):
-        """Keep only last N checkpoints."""
-        keep_n = self.train_config.checkpointing.keep_last_n
-        checkpoints = sorted(self.checkpoint_dir.glob("checkpoint_step_*"))
-        
-        for old_ckpt in checkpoints[:-keep_n]:
-            import shutil
-            shutil.rmtree(old_ckpt)
-    
-    def _save_final_model(self):
-        """Save final model."""
-        final_path = Path(self.config.model_saving.final_model_path)
-        final_path.mkdir(parents=True, exist_ok=True)
-        
-        self.policy.model.save_pretrained(final_path)
-        self.policy.tokenizer.save_pretrained(final_path)
-        
-        logger.info(f"Final model saved: {final_path}")
-    
-    def _run_championship(self):
-        """Run championship round."""
-        logger.info("Starting championship round...")
-        self._broadcast({
-            'type': 'info',
-            'message': 'Starting championship round!'
-        })
-        
-        passed = 0
-        for task in self.pr_tasks:
-            # Single attempt per PR
-            obs = self.env.reset(task.data, task.depends_on)
-            self.policy.reset_conversation()
-            
-            output = self.policy.generate(
-                obs.content,
-                system_prompt=self._get_system_prompt()
-            )
-            
-            action = self.env.parse_action(output.text)
-            self.env.step(action)
-            episode = self.env.get_episode()
-            
-            if episode.solved:
-                passed += 1
-                logger.info(f"Championship: {task.pr_id} PASSED")
-            else:
-                logger.info(f"Championship: {task.pr_id} FAILED")
-            
-            self.env.cleanup()
-        
-        result = passed == len(self.pr_tasks)
-        logger.info(f"Championship: {passed}/{len(self.pr_tasks)} - {'PASSED' if result else 'FAILED'}")
-        
-        self._broadcast({
-            'type': 'championship_complete',
-            'passed': passed,
-            'total': len(self.pr_tasks),
-            'success': result
-        })
-        
-        return result
-    
-    def load_checkpoint(self, path: str):
-        """Load from checkpoint."""
-        checkpoint_path = Path(path)
-        
-        # Load LoRA
-        from peft import PeftModel
-        self.policy.model = PeftModel.from_pretrained(
-            self.policy.model,
-            checkpoint_path / "lora"
-        )
-        
-        # Load training state
-        state = torch.load(checkpoint_path / "trainer_state.pt")
-        self.optimizer.load_state_dict(state['optimizer'])
-        
-        # Restore stats
-        stats_dict = state['stats']
-        self.stats.total_steps = stats_dict['total_steps']
-        self.stats.total_episodes = stats_dict['total_episodes']
-        self.stats.current_pr_idx = stats_dict['current_pr_idx']
-        self.stats.solved_prs = stats_dict['solved_prs']
-        self.stats.best_rewards = stats_dict['best_rewards']
-        
-        logger.info(f"Loaded checkpoint from {checkpoint_path}")
