@@ -81,11 +81,18 @@ function PRViewer({ prs, currentPR }: PRViewerProps) {
                       {getDifficultyStars(pr.difficulty)}
                     </div>
                     
-                    {pr.best_reward > 0 && (
-                      <span className="text-xs text-gray-400">
-                        Best: {pr.best_reward.toFixed(2)}
-                      </span>
-                    )}
+                    <div className="flex items-center gap-2">
+                      {pr.attempts > 0 && (
+                        <span className="text-xs text-gray-500">
+                          {pr.attempts} attempts
+                        </span>
+                      )}
+                      {pr.best_reward > 0 && (
+                        <span className="text-xs text-gray-400">
+                          R={pr.best_reward.toFixed(2)}
+                        </span>
+                      )}
+                    </div>
                   </div>
                 </div>
               </div>

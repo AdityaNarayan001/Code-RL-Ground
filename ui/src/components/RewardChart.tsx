@@ -1,11 +1,12 @@
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Area, AreaChart } from 'recharts'
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Area, AreaChart, ReferenceLine } from 'recharts'
 import { EpisodeMetric } from '../types'
 
 interface RewardChartProps {
   data: EpisodeMetric[]
+  currentStep?: number
 }
 
-function RewardChart({ data }: RewardChartProps) {
+function RewardChart({ data, currentStep }: RewardChartProps) {
   // Calculate moving average
   const windowSize = 10
   const chartData = data.map((point, i) => {
@@ -28,6 +29,9 @@ function RewardChart({ data }: RewardChartProps) {
       </div>
     )
   }
+
+  // Find current episode (latest)
+  const currentEpisode = chartData.length > 0 ? chartData[chartData.length - 1].episode : 0
 
   return (
     <ResponsiveContainer width="100%" height="100%">
@@ -56,7 +60,17 @@ function RewardChart({ data }: RewardChartProps) {
             borderRadius: '0.5rem',
           }}
           labelStyle={{ color: '#9ca3af' }}
+          formatter={(value: number) => value.toFixed(3)}
         />
+        {/* Current episode indicator */}
+        {currentEpisode > 0 && (
+          <ReferenceLine 
+            x={currentEpisode} 
+            stroke="#f59e0b" 
+            strokeWidth={2}
+            strokeDasharray="4 4"
+          />
+        )}
         <Area
           type="monotone"
           dataKey="reward"

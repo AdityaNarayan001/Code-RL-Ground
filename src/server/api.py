@@ -183,6 +183,7 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
         
         solved = state.training_stats.get('solved_prs', [])
         best_rewards = state.training_stats.get('best_rewards', {})
+        attempts_per_pr = state.training_stats.get('attempts_per_pr', {})
         
         result = []
         for task in tasks:
@@ -196,7 +197,7 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
                 difficulty=task.difficulty,
                 status=status,
                 best_reward=best_rewards.get(task.pr_id, 0.0),
-                attempts=0  # TODO: Track per-PR attempts
+                attempts=attempts_per_pr.get(task.pr_id, 0)
             ))
         
         return result

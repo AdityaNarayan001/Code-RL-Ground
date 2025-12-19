@@ -2,6 +2,7 @@ import { Play, Square, Wifi, WifiOff, Clock, Zap, CheckCircle } from 'lucide-rea
 import { TrainingStatus, PRInfo, TrainingMetrics, WSMessage } from '../types'
 import MetricsPanel from './MetricsPanel'
 import RewardChart from './RewardChart'
+import LossChart from './LossChart'
 import PRViewer from './PRViewer'
 import LiveGeneration from './LiveGeneration'
 import ToolCallLog from './ToolCallLog'
@@ -99,12 +100,20 @@ function Dashboard({
         {/* Main area */}
         <main className="flex-1 flex flex-col overflow-hidden">
           {/* Charts */}
-          <div className="h-72 border-b border-gray-700 p-4 flex gap-6 shrink-0">
+          <div className="h-80 border-b border-gray-700 p-4 flex gap-4 shrink-0">
             <div className="flex-1 bg-gray-800 rounded-lg p-4 min-w-0">
-              <h3 className="text-sm font-medium text-gray-400 mb-2">Reward Over Time</h3>
-              <RewardChart data={metrics.episodes} />
+              <h3 className="text-sm font-medium text-gray-400 mb-2">Reward Over Episodes</h3>
+              <div className="h-[calc(100%-28px)]">
+                <RewardChart data={metrics.episodes} currentStep={status?.current_step} />
+              </div>
             </div>
-            <div className="w-80 shrink-0">
+            <div className="flex-1 bg-gray-800 rounded-lg p-4 min-w-0">
+              <h3 className="text-sm font-medium text-gray-400 mb-2">Loss Over Steps</h3>
+              <div className="h-[calc(100%-28px)]">
+                <LossChart data={metrics.steps} currentStep={status?.current_step} />
+              </div>
+            </div>
+            <div className="w-72 shrink-0">
               <MetricsPanel 
                 avgReward={status?.avg_reward || 0}
                 solvedPRs={solvedCount}

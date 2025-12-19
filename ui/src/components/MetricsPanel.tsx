@@ -57,12 +57,12 @@ function MetricsPanel({ avgReward, solvedPRs, totalPRs, step }: MetricsPanelProp
       </div>
 
       {/* Progress bar */}
-      <div className="mt-auto">
-        <div className="flex justify-between text-xs text-gray-400 mb-1">
+      <div className="mt-auto pt-4 border-t border-gray-700">
+        <div className="flex justify-between text-xs text-gray-400 mb-2">
           <span>Progress</span>
           <span>{solvedPRs} of {totalPRs} PRs</span>
         </div>
-        <div className="h-2 bg-gray-700 rounded-full overflow-hidden">
+        <div className="h-3 bg-gray-700 rounded-full overflow-hidden">
           <div 
             className="h-full bg-gradient-to-r from-blue-500 to-purple-500 transition-all duration-500"
             style={{ width: `${progress}%` }}

@@ -30,26 +30,37 @@ function App() {
 
   // Setup WebSocket connection
   useEffect(() => {
-    const wsUrl = `ws://${window.location.host}/ws`
-    const ws = new WebSocket(wsUrl)
+    let ws: WebSocket | null = null
+    let reconnectTimeout: NodeJS.Timeout | null = null
+    let isMounted = true
     
-    ws.onopen = () => {
-      setConnected(true)
-      console.log('WebSocket connected')
-    }
-    
-    ws.onclose = (event) => {
-      setConnected(false)
-      console.log('WebSocket disconnected', event.code, event.reason)
-      // Only reconnect if it wasn't a clean close and component is still mounted
-      if (event.code !== 1000) {
-        console.log('Will reconnect in 5 seconds...')
+    const connect = () => {
+      if (!isMounted) return
+      
+      const wsUrl = `ws://${window.location.host}/ws`
+      ws = new WebSocket(wsUrl)
+      
+      ws.onopen = () => {
+        if (isMounted) {
+          setConnected(true)
+          console.log('WebSocket connected')
+        }
       }
-    }
-    
-    ws.onerror = (error) => {
-      console.error('WebSocket error:', error)
-    }
+      
+      ws.onclose = (event) => {
+        if (isMounted) {
+          setConnected(false)
+          console.log('WebSocket disconnected', event.code)
+          // Reconnect after delay (but not on clean close or unmount)
+          if (event.code !== 1000 && isMounted) {
+            reconnectTimeout = setTimeout(connect, 3000)
+          }
+        }
+      }
+      
+      ws.onerror = (error) => {
+        console.error('WebSocket error:', error)
+      }
     
     ws.onmessage = (event) => {
       try {
@@ -90,17 +101,23 @@ function App() {
     }
     
     wsRef.current = ws
+    }
+    
+    // Initial connect
+    connect()
     
     // Ping to keep alive
     const pingInterval = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
+      if (ws?.readyState === WebSocket.OPEN) {
         ws.send('ping')
       }
     }, 30000)
     
     return () => {
+      isMounted = false
+      if (reconnectTimeout) clearTimeout(reconnectTimeout)
       clearInterval(pingInterval)
-      ws.close()
+      if (ws) ws.close(1000)  // Clean close
     }
   }, [fetchData])
 

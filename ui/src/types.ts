@@ -23,6 +23,11 @@ export interface StepMetric {
   avg_reward: number
   solve_rate: number
   loss: number
+  pg_loss?: number
+  kl_loss?: number
+  grad_norm?: number
+  clip_frac?: number
+  max_reward?: number
 }
 
 export interface EpisodeMetric {
@@ -39,6 +44,15 @@ export interface TrainingMetrics {
 
 export interface WSMessage {
   type: string
+  pr_id?: string
+  episode?: number
+  turn?: number
+  group_idx?: number
+  turns?: number
+  reward?: number
+  solved?: boolean
+  full_text?: string
+  message?: string
   [key: string]: any
 }
 

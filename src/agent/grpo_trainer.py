@@ -51,6 +51,7 @@ class TrainingStats:
     best_rewards: Dict[str, float] = field(default_factory=dict)
     solved_prs: List[str] = field(default_factory=list)
     recent_rewards: deque = field(default_factory=lambda: deque(maxlen=100))
+    attempts_per_pr: Dict[str, int] = field(default_factory=dict)  # Track attempts per PR
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -61,7 +62,8 @@ class TrainingStats:
             'consecutive_solves': self.consecutive_solves,
             'best_rewards': self.best_rewards,
             'solved_prs': self.solved_prs,
-            'avg_reward': np.mean(list(self.recent_rewards)) if self.recent_rewards else 0.0
+            'avg_reward': np.mean(list(self.recent_rewards)) if self.recent_rewards else 0.0,
+            'attempts_per_pr': self.attempts_per_pr
         }
 
 
@@ -288,8 +290,29 @@ class GRPOTrainer:
                 
                 # Execute action in environment
                 action = self.env.parse_action(output.text)
+                
+                # Broadcast tool call
+                if action.tool_name:
+                    self._broadcast({
+                        'type': 'tool_call',
+                        'tool': action.tool_name,
+                        'args': action.tool_args,
+                        'pr_id': task.pr_id,
+                        'turn': turn
+                    })
+                
                 obs = self.env.step(action)
                 terminal = obs.is_terminal
+                
+                # Broadcast tool result
+                if action.tool_name:
+                    self._broadcast({
+                        'type': 'tool_result',
+                        'tool': action.tool_name,
+                        'success': obs.info.get('success', True) if obs.info else True,
+                        'output': obs.content[:200] if obs.content else '',
+                        'terminal': terminal
+                    })
                 
                 # Add to conversation history
                 conversation_history.append({
@@ -324,14 +347,17 @@ class GRPOTrainer:
             )['input_ids'][0]
             
             # Broadcast episode completion
+            full_conversation = "\n---\n".join([h['content'] for h in conversation_history if h['role'] == 'assistant'])
             self._broadcast({
                 'type': 'generation_complete',
                 'pr_id': task.pr_id,
                 'episode': self.stats.total_episodes + 1,
+                'turn': self.stats.total_episodes + 1,  # For UI compatibility
                 'group_idx': i + 1,
                 'turns': turn,
                 'reward': reward,
-                'solved': solved
+                'solved': solved,
+                'full_text': full_conversation
             })
             
             rollouts.append(RolloutData(
@@ -348,6 +374,11 @@ class GRPOTrainer:
             # Update stats
             self.stats.total_episodes += 1
             self.stats.recent_rewards.append(reward)
+            
+            # Track attempts per PR
+            if task.pr_id not in self.stats.attempts_per_pr:
+                self.stats.attempts_per_pr[task.pr_id] = 0
+            self.stats.attempts_per_pr[task.pr_id] += 1
             
             if reward > self.stats.best_rewards.get(task.pr_id, 0):
                 self.stats.best_rewards[task.pr_id] = reward
