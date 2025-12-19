@@ -81,10 +81,10 @@ Key settings in `config.yaml`:
 model:
   name: "Qwen/Qwen2.5-3B"
   device: "mps"
-  quantization: "4bit"
+  quantization: null  # MPS doesn't support quantization
 
 training:
-  algorithm: "ppo"
+  algorithm: "grpo"   # Group Relative Policy Optimization
   learning_rate: 1.0e-5
   batch_size: 2
   
