@@ -207,95 +207,142 @@ class GRPOTrainer:
     def _collect_rollouts(self, task: PRTask) -> List[RolloutData]:
         """Collect a group of rollouts for the given task.
         
-        Generates K completions, executes each in the environment,
-        and collects token-level log probs.
+        Runs full multi-turn episodes where model can:
+        1. Read files
+        2. Edit files  
+        3. Submit for reward
         """
         rollouts = []
-        group_id = str(uuid.uuid4())  # Same group ID for all completions from this prompt
+        group_id = str(uuid.uuid4())
+        max_turns = self.config.environment.max_turns
         
-        # Get prompt from environment
-        obs = self.env.reset(task.data, task.depends_on)
-        prompt_text = obs.content
         system_prompt = self._get_system_prompt()
         
-        # Build full prompt with chat template
-        messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": prompt_text})
-        
-        if hasattr(self.policy.tokenizer, 'apply_chat_template'):
-            full_prompt = self.policy.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-        else:
-            full_prompt = prompt_text
-        
-        # Tokenize prompt
-        prompt_encoding = self.policy.tokenizer(
-            full_prompt, return_tensors="pt", truncation=True
-        )
-        prompt_ids = prompt_encoding['input_ids'][0]
-        
-        # Generate K completions
+        # Generate K episode rollouts
         for i in range(self.group_size):
+            # Reset for new episode
             self.policy.reset_conversation()
+            obs = self.env.reset(task.data, task.depends_on)
             
-            # Generate with varying temperature for diversity
+            # Collect all tokens and log probs across the episode
+            all_response_ids = []
+            all_log_probs = []
+            all_prompts = []
+            
+            # Track conversation for multi-turn
+            conversation_history = []
+            
+            # Temperature varies by group member for diversity
             temperature = 0.7 + 0.1 * i
-            output = self.policy.generate(
-                prompt_text,
-                system_prompt=system_prompt,
-                return_log_probs=True,
-                temperature=temperature
-            )
             
-            # Broadcast for UI - use global episode count, not local index
-            self._broadcast({
-                'type': 'generation_complete',
-                'pr_id': task.pr_id,
-                'turn': self.stats.total_episodes + 1,  # Running episode counter
-                'group_idx': i + 1,  # Which completion in this group (1-4)
-                'full_text': output.text
-            })
+            # Run episode until terminal or max turns
+            turn = 0
+            terminal = False
             
-            # Get response tokens
-            response_ids = torch.tensor(output.token_ids, device=self.device)
-            response_len = len(output.token_ids)
-            
-            # Create response mask (all 1s for generated tokens)
-            response_mask = torch.ones(response_len, device=self.device)
-            
-            # Get per-token log probs from generation
-            # output.log_probs shape: (seq_len, vocab_size) or similar
-            if output.log_probs is not None and len(output.log_probs.shape) > 1:
-                # Gather log probs for the actual generated tokens
-                old_log_probs = self._gather_token_log_probs(
-                    output.log_probs, response_ids
+            while not terminal and turn < max_turns:
+                turn += 1
+                
+                # Build prompt with history
+                current_prompt = self._build_turn_prompt(
+                    task, obs, conversation_history, system_prompt
                 )
-            else:
-                # Fallback: compute log probs
-                old_log_probs = self._compute_token_log_probs(
-                    prompt_ids, response_ids
+                all_prompts.append(current_prompt)
+                
+                # Generate response
+                output = self.policy.generate(
+                    current_prompt,
+                    system_prompt=system_prompt if turn == 1 else None,
+                    return_log_probs=True,
+                    temperature=temperature
                 )
+                
+                # Broadcast generation
+                self._broadcast({
+                    'type': 'generation_token',
+                    'pr_id': task.pr_id,
+                    'turn': turn,
+                    'group_idx': i + 1,
+                    'full_text': output.text
+                })
+                
+                # Collect tokens and log probs
+                response_ids = torch.tensor(output.token_ids, device=self.device)
+                all_response_ids.append(response_ids)
+                
+                # Get log probs for this turn's tokens
+                if output.log_probs is not None:
+                    prompt_ids = self.policy.tokenizer(
+                        current_prompt, return_tensors="pt", truncation=True
+                    )['input_ids'][0]
+                    if len(output.log_probs.shape) > 1:
+                        lp = self._gather_token_log_probs(output.log_probs, response_ids)
+                    else:
+                        lp = output.log_probs
+                    all_log_probs.append(lp)
+                else:
+                    prompt_ids = self.policy.tokenizer(
+                        current_prompt, return_tensors="pt", truncation=True
+                    )['input_ids'][0]
+                    lp = self._compute_token_log_probs(prompt_ids, response_ids)
+                    all_log_probs.append(lp)
+                
+                # Execute action in environment
+                action = self.env.parse_action(output.text)
+                obs = self.env.step(action)
+                terminal = obs.is_terminal
+                
+                # Add to conversation history
+                conversation_history.append({
+                    'role': 'assistant',
+                    'content': output.text
+                })
+                if not terminal:
+                    conversation_history.append({
+                        'role': 'user', 
+                        'content': obs.content
+                    })
             
-            # Execute in environment to get reward
-            self.env.reset(task.data, task.depends_on)
-            action = self.env.parse_action(output.text)
-            obs = self.env.step(action)
+            # Get episode result
             episode = self.env.get_episode()
             reward = episode.total_reward if episode else 0.0
             solved = episode.solved if episode else False
             
+            # Concatenate all response tokens
+            if all_response_ids:
+                combined_response_ids = torch.cat(all_response_ids)
+                combined_log_probs = torch.cat(all_log_probs)
+                response_mask = torch.ones(len(combined_response_ids), device=self.device)
+            else:
+                combined_response_ids = torch.zeros(1, dtype=torch.long, device=self.device)
+                combined_log_probs = torch.zeros(1, device=self.device)
+                response_mask = torch.zeros(1, device=self.device)
+            
+            # Use first prompt's token ids as base (for advantage computation)
+            first_prompt = all_prompts[0] if all_prompts else ""
+            prompt_ids = self.policy.tokenizer(
+                first_prompt, return_tensors="pt", truncation=True
+            )['input_ids'][0]
+            
+            # Broadcast episode completion
+            self._broadcast({
+                'type': 'generation_complete',
+                'pr_id': task.pr_id,
+                'episode': self.stats.total_episodes + 1,
+                'group_idx': i + 1,
+                'turns': turn,
+                'reward': reward,
+                'solved': solved
+            })
+            
             rollouts.append(RolloutData(
                 prompt_ids=prompt_ids.to(self.device),
-                response_ids=response_ids,
+                response_ids=combined_response_ids,
                 response_mask=response_mask,
-                old_log_probs=old_log_probs.detach(),
+                old_log_probs=combined_log_probs.detach(),
                 reward=reward,
                 solved=solved,
                 group_id=group_id,
-                response_text=output.text
+                response_text="\n---\n".join([h['content'] for h in conversation_history if h['role'] == 'assistant'])
             ))
             
             # Update stats
@@ -318,10 +365,26 @@ class GRPOTrainer:
                 'pr_id': task.pr_id,
                 'reward': reward,
                 'solved': solved,
-                'message': f'Episode {self.stats.total_episodes}: {task.pr_id} - R={reward:.2f}'
+                'turns': turn,
+                'message': f'Episode {self.stats.total_episodes}: {task.pr_id} - R={reward:.2f} ({turn} turns)'
             })
         
         return rollouts
+    
+    def _build_turn_prompt(
+        self, 
+        task: PRTask, 
+        obs: Any, 
+        history: List[Dict[str, str]],
+        system_prompt: str
+    ) -> str:
+        """Build prompt for a turn in multi-turn episode."""
+        if not history:
+            # First turn - return observation content
+            return obs.content
+        else:
+            # Subsequent turns - return observation (tool result/feedback)
+            return obs.content
     
     def _gather_token_log_probs(
         self, 
