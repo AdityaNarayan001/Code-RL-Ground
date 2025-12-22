@@ -76,13 +76,13 @@ class LLMPolicy:
         self.config = config
         self.model_config = config.model
         
-        # Determine device
-        if device:
+        # Determine device (auto-detect if not specified or "auto")
+        if device and device != "auto":
             self.device = device
-        elif torch.backends.mps.is_available():
-            self.device = "mps"
         elif torch.cuda.is_available():
             self.device = "cuda"
+        elif torch.backends.mps.is_available():
+            self.device = "mps"
         else:
             self.device = "cpu"
         
@@ -109,29 +109,34 @@ class LLMPolicy:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         
-        # Quantization config
+        # Quantization config (auto = 4bit on CUDA, none on MPS/CPU)
+        quant_setting = self.model_config.quantization
+        if quant_setting == "auto":
+            quant_setting = "4bit" if self.device == "cuda" else "none"
+            logger.info(f"Auto-selected quantization: {quant_setting} (device: {self.device})")
+        
         quant_config = None
-        if self.model_config.quantization == "4bit":
+        if quant_setting == "4bit" and self.device == "cuda":
             quant_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_compute_dtype=torch.float16,
                 bnb_4bit_use_double_quant=True
             )
-        elif self.model_config.quantization == "8bit":
+        elif quant_setting == "8bit" and self.device == "cuda":
             quant_config = BitsAndBytesConfig(load_in_8bit=True)
         
         # Load model
         model_kwargs = {
             "trust_remote_code": True,
-            "dtype": torch.float16,
+            "torch_dtype": torch.float16,
         }
         
-        if quant_config and self.device != "mps":
+        if quant_config:
             model_kwargs["quantization_config"] = quant_config
             model_kwargs["device_map"] = "auto"
         else:
-            # For MPS or no quantization
+            # For MPS/CPU or no quantization
             model_kwargs["device_map"] = None
         
         self.model = AutoModelForCausalLM.from_pretrained(

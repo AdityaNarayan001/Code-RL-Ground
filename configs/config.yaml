@@ -16,8 +16,8 @@ paths:
 model:
   name: "Qwen/Qwen2.5-3B"
   backend: "transformers"  # transformers for HuggingFace/PyTorch
-  quantization: "4bit"  # 4bit, 8bit, or none (using bitsandbytes)
-  device: "mps"  # mps for M4 Mac, cuda for NVIDIA, cpu for fallback
+  quantization: "auto"  # auto, 4bit, 8bit, or none (4bit/8bit only on CUDA)
+  device: "auto"  # auto, cuda, mps, or cpu
   max_context_length: 8192
   generation:
     max_new_tokens: 2048
