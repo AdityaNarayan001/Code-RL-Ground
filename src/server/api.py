@@ -40,6 +40,7 @@ class TrainingStatus(BaseModel):
     solved_prs: List[str]
     avg_reward: float
     elapsed_time: float
+    device: str = "auto"
 
 
 class PRInfo(BaseModel):
@@ -163,6 +164,15 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
         if state.start_time:
             elapsed = (datetime.now() - state.start_time).total_seconds()
         
+        # Detect device
+        import torch
+        if torch.cuda.is_available():
+            device = "CUDA"
+        elif torch.backends.mps.is_available():
+            device = "MPS"
+        else:
+            device = "CPU"
+        
         return TrainingStatus(
             is_running=state.is_training,
             current_step=state.training_stats.get('total_steps', 0),
@@ -170,7 +180,8 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
             current_pr=state.training_stats.get('current_pr_id'),
             solved_prs=state.training_stats.get('solved_prs', []),
             avg_reward=state.training_stats.get('avg_reward', 0.0),
-            elapsed_time=elapsed
+            elapsed_time=elapsed,
+            device=device
         )
     
     @app.get("/api/prs")
@@ -300,6 +311,10 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
                         episodes = state.training_stats.get('total_episodes', 1)
                         # Running average
                         state.training_stats['avg_reward'] = old_avg + (reward - old_avg) / max(1, episodes)
+                    elif data.get('type') == 'generation_token':
+                        # Update current PR immediately when generation starts
+                        if data.get('pr_id'):
+                            state.training_stats['current_pr_id'] = data.get('pr_id')
                     elif data.get('type') == 'generation_complete':
                         # Update current group info
                         state.training_stats['current_group'] = data.get('group_idx', 0)

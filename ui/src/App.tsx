@@ -74,6 +74,10 @@ function App() {
         switch (data.type) {
           case 'generation_token':
             setGeneratingText(data.full_text || '')
+            // Fetch status on first turn to update current PR immediately
+            if (data.turn === 1) {
+              fetch('/api/status').then(r => r.json()).then(setStatus).catch(() => {})
+            }
             break
           case 'generation_complete':
             setGeneratingText('')

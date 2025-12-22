@@ -49,6 +49,15 @@ function Dashboard({
               {connected ? <Wifi size={16} /> : <WifiOff size={16} />}
               {connected ? 'Connected' : 'Disconnected'}
             </span>
+            {status?.device && (
+              <span className={`px-2 py-0.5 rounded text-xs font-medium ${
+                status.device === 'CUDA' ? 'bg-green-600 text-white' :
+                status.device === 'MPS' ? 'bg-blue-600 text-white' :
+                'bg-gray-600 text-white'
+              }`}>
+                {status.device}
+              </span>
+            )}
           </div>
           
           <div className="flex items-center gap-4">

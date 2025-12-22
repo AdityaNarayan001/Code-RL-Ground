@@ -6,6 +6,7 @@ export interface TrainingStatus {
   solved_prs: string[]
   avg_reward: number
   elapsed_time: number
+  device: string
 }
 
 export interface PRInfo {
