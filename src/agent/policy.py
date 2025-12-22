@@ -129,7 +129,7 @@ class LLMPolicy:
         # Load model
         model_kwargs = {
             "trust_remote_code": True,
-            "torch_dtype": torch.float16,
+            "dtype": torch.float16,
         }
         
         if quant_config:
