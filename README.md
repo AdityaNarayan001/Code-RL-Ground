@@ -1,5 +1,7 @@
 # Code-RL-Ground
 
+![ui preview](./asset/asset_1.png)
+
 An RL-based code learning environment where a small language model (Qwen2.5-3B) learns to master a repository by solving PRs sequentially using **GRPO (Group Relative Policy Optimization)**.
 
 ## Overview
@@ -52,20 +54,29 @@ Edit `configs/config.yaml` to set:
 
 ### 3. Run Training
 
-**Option A: Command line**
+**Option A: Command line (no UI)**
 ```bash
 python scripts/train.py --config configs/config.yaml
 ```
 
-**Option B: With dashboard**
+**Option B: With dashboard (development mode)**
 ```bash
-# Start API server (serves both API and UI)
-python -m src.server.api
+# Terminal 1 - API server
+python scripts/serve.py
 
-# Or for UI development:
+# Terminal 2 - UI dev server (hot reload)
 cd ui && npm run dev
 ```
+Then open http://localhost:3000 and click "Start Training"
 
+**Option C: With dashboard (production mode)**
+```bash
+# Build UI first (one time)
+cd ui && npm run build
+
+# Start server (serves both API and built UI)
+python -m src.server.api
+```
 Then open http://localhost:8000 and click "Start Training"
 
 ### 4. Evaluate
