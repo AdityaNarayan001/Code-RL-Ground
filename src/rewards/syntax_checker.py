@@ -1,12 +1,13 @@
 """Syntax checking for Python code."""
 
 import ast
+import builtins
 from typing import Tuple, Optional, List
 from dataclasses import dataclass
 
 
 @dataclass
-class SyntaxError:
+class SyntaxErrorInfo:
     """A syntax error in code."""
     line: int
     column: int
@@ -18,7 +19,7 @@ class SyntaxError:
 class SyntaxResult:
     """Result of syntax check."""
     valid: bool
-    errors: List[SyntaxError]
+    errors: List[SyntaxErrorInfo]
 
 
 class SyntaxChecker:
@@ -39,11 +40,11 @@ class SyntaxChecker:
         try:
             ast.parse(code)
             return SyntaxResult(valid=True, errors=[])
-        except SyntaxError as e:
-            error = SyntaxError(
+        except builtins.SyntaxError as e:
+            error = SyntaxErrorInfo(
                 line=e.lineno or 0,
                 column=e.offset or 0,
-                message=e.msg or str(e),
+                message=e.msg if hasattr(e, 'msg') else str(e),
                 text=e.text
             )
             return SyntaxResult(valid=False, errors=[error])
@@ -64,7 +65,7 @@ class SyntaxChecker:
         except Exception as e:
             return SyntaxResult(
                 valid=False,
-                errors=[SyntaxError(line=0, column=0, message=str(e))]
+                errors=[SyntaxErrorInfo(line=0, column=0, message=str(e))]
             )
     
     def check_multiple(self, files: dict) -> dict:

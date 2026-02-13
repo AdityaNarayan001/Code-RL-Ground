@@ -15,6 +15,7 @@ from src.utils.config import load_config
 from src.utils.logging import setup_logging, get_logger
 from src.data import PRLoader
 from src.environment import CodeEnv
+from src.environment.code_env import Action, ActionType, Observation
 from src.agent import LLMPolicy
 from src.utils.repo_state import RepoStateManager
 
@@ -24,7 +25,8 @@ DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "config.yaml"
 def evaluate_pr(
     policy: LLMPolicy,
     env: CodeEnv,
-    pr_id: str,
+    pr_data: dict,
+    dependency_prs: list,
     max_turns: int = 10
 ) -> dict:
     """Evaluate model on a single PR.
@@ -32,7 +34,8 @@ def evaluate_pr(
     Args:
         policy: The policy to evaluate
         env: The environment
-        pr_id: PR to evaluate
+        pr_data: PR task data dictionary
+        dependency_prs: List of dependency PR IDs
         max_turns: Maximum turns allowed
         
     Returns:
@@ -40,35 +43,37 @@ def evaluate_pr(
     """
     logger = get_logger(__name__)
     
-    obs = env.reset(pr_id)
-    total_reward = 0
+    obs = env.reset(pr_data, dependency_prs)
     turns = 0
     actions = []
     
     for turn in range(max_turns):
         # Generate action
-        prompt = obs['prompt']
-        action, _ = policy.generate(prompt, max_tokens=2048)
-        actions.append(action)
+        prompt = obs.content
+        output = policy.generate(prompt)
+        action_text = output.text
+        actions.append(action_text)
         
-        # Execute
-        obs, reward, done, info = env.step(action)
-        total_reward += reward
+        # Parse and execute
+        action = env.parse_action(action_text)
+        obs = env.step(action)
         turns += 1
         
-        logger.info(f"  Turn {turn + 1}: reward={reward:.3f}, done={done}")
+        logger.info(f"  Turn {turn + 1}: terminal={obs.is_terminal}")
         
-        if done:
+        if obs.is_terminal:
             break
     
-    solved = info.get('solved', False)
+    # Get episode result
+    episode = env.get_episode()
+    total_reward = episode.total_reward if episode else 0.0
+    solved = episode.solved if episode else False
     
     return {
-        'pr_id': pr_id,
+        'pr_id': pr_data['pr_id'],
         'solved': solved,
         'total_reward': total_reward,
         'turns': turns,
-        'final_info': info,
     }
 
 
@@ -108,7 +113,7 @@ def main():
 
     # Load configuration
     config = load_config(args.config)
-    setup_logging(log_dir=config.logging.log_dir)
+    setup_logging(log_dir=config.logs_path)
     logger = get_logger(__name__)
 
     logger.info("=" * 60)
@@ -147,7 +152,8 @@ def main():
     results = []
     for pr_id in pr_ids:
         logger.info(f"\nEvaluating {pr_id}...")
-        result = evaluate_pr(policy, env, pr_id, args.max_turns)
+        task = loader.load_pr(pr_id)
+        result = evaluate_pr(policy, env, task.data, task.depends_on, args.max_turns)
         results.append(result)
         
         status = "✓ SOLVED" if result['solved'] else "✗ Not solved"

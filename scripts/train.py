@@ -9,13 +9,12 @@ PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import argparse
-import logging
 
 from src.utils.config import load_config
 from src.utils.logging import setup_logging, get_logger
 from src.data import PRLoader, CurriculumManager
 from src.environment import CodeEnv
-from src.agent import LLMPolicy, PPOTrainer
+from src.agent import LLMPolicy, GRPOTrainer
 from src.utils.repo_state import RepoStateManager
 
 DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "config.yaml"
@@ -47,8 +46,8 @@ def main():
     
     # Setup logging
     setup_logging(
-        log_dir=config.logging.log_dir,
-        level=logging.DEBUG if args.debug else logging.INFO
+        log_dir=config.logs_path,
+        level="DEBUG" if args.debug else "INFO"
     )
     logger = get_logger(__name__)
     
@@ -98,11 +97,9 @@ def main():
             pr_tasks=ordered_tasks
         )
     else:
-        trainer = PPOTrainer(
-            config=config,
-            policy=policy,
-            env=env,
-            pr_tasks=ordered_tasks
+        raise ValueError(
+            f"Unsupported training algorithm: '{algorithm}'. "
+            f"Currently only 'grpo' is supported."
         )
 
     # Resume from checkpoint if specified

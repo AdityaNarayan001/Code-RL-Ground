@@ -67,6 +67,7 @@ class ServerState:
         self.recent_logs: List[Dict[str, Any]] = []
         self.max_logs = 1000
         self.executor = ThreadPoolExecutor(max_workers=1)
+        self.trainer = None  # Reference to active trainer for stop signaling
 
 
 state = ServerState()
@@ -288,6 +289,9 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
                     pr_tasks=curriculum.get_remaining_tasks()
                 )
                 
+                # Store reference for stop signaling
+                state.trainer = trainer
+                
                 # Set callback for updates
                 def thread_safe_broadcast(data: Dict[str, Any]):
                     state.recent_logs.append(data)
@@ -348,6 +352,7 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
                 })
             finally:
                 state.is_training = False
+                state.trainer = None
                 loop.close()
         
         # Start in thread pool
@@ -363,6 +368,11 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="No training in progress")
         
         state.stop_training_flag = True
+        
+        # Signal the trainer to stop gracefully
+        if state.trainer is not None:
+            state.trainer.stop_requested = True
+        
         state.is_training = False
         
         return {"status": "stopped", "message": "Stop signal sent"}

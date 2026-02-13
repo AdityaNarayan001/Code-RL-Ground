@@ -22,6 +22,7 @@ from ..utils.logging import TrainingLogger, get_logger
 from ..utils.metrics import ExperimentLogger, create_experiment_logger
 from ..environment import CodeEnv
 from ..data import PRTask
+from ..rewards.format_reward import FormatRewardScorer, FormatRewardConfig
 from .policy import LLMPolicy
 
 logger = get_logger(__name__)
@@ -101,9 +102,9 @@ class GRPOTrainer:
         self.clip_range = self.grpo_config.clip_range
         self.learning_rate = self.train_config.learning_rate
         
-        # Setup optimizer
+        # Setup optimizer — only track trainable (LoRA) parameters to save memory
         self.optimizer = torch.optim.AdamW(
-            self.policy.model.parameters(),
+            filter(lambda p: p.requires_grad, self.policy.model.parameters()),
             lr=self.learning_rate
         )
         
@@ -122,6 +123,17 @@ class GRPOTrainer:
         
         # Callback
         self._ws_callback = None
+        
+        # Stop flag (set externally to request graceful stop)
+        self.stop_requested = False
+        
+        # Format reward shaping (dense signal for cold-start)
+        format_config = FormatRewardConfig(
+            enabled=True,
+            warmup_steps=50,
+            decay_steps=150,
+        )
+        self.format_scorer = FormatRewardScorer(config=format_config)
         
         # Device
         self.device = next(self.policy.model.parameters()).device
@@ -154,6 +166,15 @@ class GRPOTrainer:
         
         try:
             while self.stats.current_pr_idx < len(self.pr_tasks):
+                # Check if stop has been requested
+                if self.stop_requested:
+                    logger.info("Stop requested — exiting training loop.")
+                    self._broadcast({
+                        'type': 'info',
+                        'message': 'Training stopped by user'
+                    })
+                    return {'stats': self.stats.to_dict()}
+                
                 current_task = self.pr_tasks[self.stats.current_pr_idx]
                 self.stats.current_pr_id = current_task.pr_id
                 
@@ -165,6 +186,15 @@ class GRPOTrainer:
                 
                 # Train until solved
                 while not self._is_pr_solved(current_task.pr_id):
+                    # Check if stop has been requested
+                    if self.stop_requested:
+                        logger.info("Stop requested — exiting training loop.")
+                        self._broadcast({
+                            'type': 'info',
+                            'message': 'Training stopped by user'
+                        })
+                        return {'stats': self.stats.to_dict()}
+                    
                     # Collect rollouts (group of completions)
                     rollouts = self._collect_rollouts(current_task)
                     
@@ -327,8 +357,18 @@ class GRPOTrainer:
             
             # Get episode result
             episode = self.env.get_episode()
-            reward = episode.total_reward if episode else 0.0
+            task_reward = episode.total_reward if episode else 0.0
             solved = episode.solved if episode else False
+            
+            # Compute format shaping reward (dense signal for cold-start)
+            assistant_outputs = [h['content'] for h in conversation_history if h['role'] == 'assistant']
+            format_reward = self.format_scorer.score_episode(
+                turn_outputs=assistant_outputs,
+                training_step=self.stats.total_steps,
+            )
+            
+            # Combined reward: task reward + format shaping (clamped to [0, 1])
+            reward = min(1.0, task_reward + format_reward)
             
             # Concatenate all response tokens
             if all_response_ids:
@@ -409,13 +449,33 @@ class GRPOTrainer:
         history: List[Dict[str, str]],
         system_prompt: str
     ) -> str:
-        """Build prompt for a turn in multi-turn episode."""
+        """Build prompt for a turn in multi-turn episode.
+        
+        Includes conversation history so the model has context of prior
+        tool calls and their results.
+        """
         if not history:
-            # First turn - return observation content
+            # First turn - return observation content (task description)
             return obs.content
         else:
-            # Subsequent turns - return observation (tool result/feedback)
-            return obs.content
+            # Subsequent turns - include recent history for context
+            # Keep last N turns to avoid context overflow
+            max_history_turns = 6  # 3 assistant + 3 user messages
+            recent_history = history[-max_history_turns:]
+            
+            parts = []
+            for msg in recent_history:
+                role_label = "Assistant" if msg['role'] == 'assistant' else "Result"
+                content = msg['content']
+                # Truncate very long results to save context
+                if msg['role'] == 'user' and len(content) > 500:
+                    content = content[:500] + "\n... (truncated)"
+                parts.append(f"[{role_label}]\n{content}")
+            
+            parts.append(f"[Result]\n{obs.content}")
+            parts.append("\nContinue with the next action:")
+            
+            return "\n\n".join(parts)
     
     def _gather_token_log_probs(
         self, 
@@ -578,9 +638,9 @@ class GRPOTrainer:
         # Backward
         total_loss.backward()
         
-        # Gradient clipping
+        # Gradient clipping (only trainable parameters)
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            self.policy.model.parameters(), 1.0
+            [p for p in self.policy.model.parameters() if p.requires_grad], 1.0
         )
         
         # Optimizer step
@@ -652,33 +712,39 @@ class GRPOTrainer:
         return False
     
     def _get_system_prompt(self) -> str:
-        """Get system prompt for the agent with few-shot examples."""
-        return """You are a skilled software engineer. Your task is to implement the requested code changes.
+        """Get system prompt for the agent.
+        
+        Optimized for small models (0.5B-3B):
+        - Short and direct
+        - Format shown before explanation
+        - One concrete example with exact syntax
+        - Strong anchoring on the <tool>...</tool> pattern
+        """
+        return """You are a code assistant. You solve tasks by calling tools.
 
-IMPORTANT: You MUST use the exact tool format shown below. Do NOT use markdown code blocks.
-
-## Tool Format
+ALWAYS use this EXACT format:
 <tool>tool_name(param="value")</tool>
 
-## Available Tools
-- read_file(path) - Read a file
-- write_file(path, content) - Write a new file  
-- edit_file(path, old_content, new_content) - Edit existing file
-- run_python(code) - Run Python code
-- submit() - Submit your solution
+Tools:
+- read_file(path="...") — read a file
+- edit_file(path="...", old_content="...", new_content="...") — edit a file
+- write_file(path="...", content="...") — create a file
+- run_python(code="...") — run python code
+- submit() — submit your solution
 
-## Example: Adding a function to a file
+Example — read a file then edit it:
+<tool>read_file(path="pyutils/strings.py")</tool>
 
-1. First, read the file:
-<tool>read_file(path="utils/math.py")</tool>
+After seeing the file content:
+<tool>edit_file(path="pyutils/strings.py", old_content="def reverse_string(s):\\n    return s[::-1]", new_content="def reverse_string(s):\\n    return s[::-1]\\n\\ndef count_chars(s):\\n    return len(s)")</tool>
 
-2. Then edit it to add new code:
-<tool>edit_file(path="utils/math.py", old_content="def add(a, b):\\n    return a + b", new_content="def add(a, b):\\n    return a + b\\n\\ndef multiply(a, b):\\n    return a * b")</tool>
-
-3. Submit when done:
+When done:
 <tool>submit()</tool>
 
-Now complete the task using ONLY this exact <tool>...</tool> format. No explanations needed - just tool calls."""
+Rules:
+1. ALWAYS wrap tool calls in <tool>...</tool> tags
+2. Read files before editing them
+3. Call submit() when finished"""
     
     def _log_progress(self, rollouts: List[RolloutData], update_stats: Dict[str, float]):
         """Log training progress using sophisticated logger."""
@@ -723,7 +789,7 @@ Now complete the task using ONLY this exact <tool>...</tool> format. No explanat
                 )
     
     def _save_checkpoint(self):
-        """Save training checkpoint."""
+        """Save training checkpoint and clean up old ones."""
         checkpoint_path = self.checkpoint_dir / f"step_{self.stats.total_steps}"
         checkpoint_path.mkdir(parents=True, exist_ok=True)
         
@@ -741,3 +807,27 @@ Now complete the task using ONLY this exact <tool>...</tool> format. No explanat
             'path': str(checkpoint_path),
             'step': self.stats.total_steps
         })
+        
+        # Clean up old checkpoints (respect keep_last_n)
+        keep_last_n = self.train_config.checkpointing.keep_last_n
+        if keep_last_n > 0:
+            self._cleanup_old_checkpoints(keep_last_n)
+    
+    def _cleanup_old_checkpoints(self, keep_last_n: int):
+        """Remove old checkpoints, keeping only the most recent N."""
+        import shutil
+        
+        # Find all checkpoint directories (step_*)
+        checkpoints = sorted(
+            [d for d in self.checkpoint_dir.iterdir() if d.is_dir() and d.name.startswith("step_")],
+            key=lambda d: int(d.name.split("_")[1]) if d.name.split("_")[1].isdigit() else 0
+        )
+        
+        # Remove oldest checkpoints if we exceed the limit
+        while len(checkpoints) > keep_last_n:
+            oldest = checkpoints.pop(0)
+            try:
+                shutil.rmtree(oldest)
+                logger.info(f"Removed old checkpoint: {oldest}")
+            except Exception as e:
+                logger.warning(f"Failed to remove checkpoint {oldest}: {e}")

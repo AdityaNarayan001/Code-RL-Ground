@@ -110,7 +110,14 @@ class TestRunner:
         elif 'function' in test and 'input' in test:
             test_code = self._build_simple_test(test)
         elif 'input' in test and 'expected' in test:
-            test_code = self._build_inline_test(test)
+            # Infer function name from code files
+            func_name = self._infer_function_name(code_files)
+            if func_name:
+                # Promote to simple test with inferred function name
+                enriched_test = {**test, 'function': func_name}
+                test_code = self._build_simple_test(enriched_test)
+            else:
+                test_code = self._build_inline_test(test, code_files)
         else:
             return {'status': 'error', 'error': 'Invalid test definition'}
         
@@ -177,25 +184,104 @@ expected = {repr(expected)}
 assert result == expected, f"Expected {{expected}}, got {{result}}"
 '''
     
-    def _build_inline_test(self, test: Dict[str, Any]) -> str:
-        """Build an inline test without function name."""
+    def _build_inline_test(self, test: Dict[str, Any], code_files: Dict[str, str] = None) -> str:
+        """Build an inline test without function name.
+        
+        Attempts to find callable functions from code_files and test them.
+        Falls back to evaluating the input as an expression if no function found.
+        """
         inputs = test['input']
         expected = test['expected']
         
-        # This assumes a test_func or similar is defined
+        # Try to find all public functions from code files
+        func_names = self._extract_all_function_names(code_files or {})
+        
+        if func_names:
+            # Try each function until one works
+            func_checks = []
+            for fn in func_names:
+                if expected == "ValueError":
+                    func_checks.append(f'''
+try:
+    {fn}({repr(inputs)})
+except ValueError:
+    import sys; sys.exit(0)
+except Exception:
+    pass
+''')
+                else:
+                    func_checks.append(f'''
+try:
+    _result = {fn}({repr(inputs)})
+    if _result == {repr(expected)}:
+        import sys; sys.exit(0)
+except Exception:
+    pass
+''')
+            
+            joined = "\n".join(func_checks)
+            if expected == "ValueError":
+                return f'''{joined}
+raise AssertionError("No function raised ValueError for input {repr(inputs)}")
+'''
+            else:
+                return f'''{joined}
+raise AssertionError("No function returned {repr(expected)} for input {repr(inputs)}")
+'''
+        
+        # Absolute fallback: evaluate as expression
         if expected == "ValueError":
             return f'''
 try:
-    test_func({repr(inputs)})
+    eval({repr(inputs)})
     raise AssertionError("Expected ValueError")
 except ValueError:
     pass
 '''
         else:
             return f'''
-result = test_func({repr(inputs)})
+result = eval({repr(inputs)})
 assert result == {repr(expected)}, f"Expected {repr(expected)}, got {{result}}"
 '''
+    
+    def _infer_function_name(self, code_files: Dict[str, str]) -> Optional[str]:
+        """Infer the most likely function name from code files.
+        
+        Looks for newly-defined functions (heuristic: last def in file).
+        
+        Returns:
+            Function name or None
+        """
+        import re
+        
+        candidates = []
+        for filepath, content in code_files.items():
+            if not filepath.endswith('.py'):
+                continue
+            # Find all top-level function definitions
+            for match in re.finditer(r'^def\s+(\w+)\s*\(', content, re.MULTILINE):
+                func_name = match.group(1)
+                # Skip private/dunder functions
+                if not func_name.startswith('_'):
+                    candidates.append(func_name)
+        
+        # Return the last candidate (most likely the newly added function)
+        return candidates[-1] if candidates else None
+    
+    def _extract_all_function_names(self, code_files: Dict[str, str]) -> List[str]:
+        """Extract all public function names from code files."""
+        import re
+        
+        func_names = []
+        for filepath, content in code_files.items():
+            if not filepath.endswith('.py'):
+                continue
+            for match in re.finditer(r'^def\s+(\w+)\s*\(', content, re.MULTILINE):
+                func_name = match.group(1)
+                if not func_name.startswith('_'):
+                    func_names.append(func_name)
+        
+        return func_names
     
     def _get_imports(self, code_files: Dict[str, str]) -> List[str]:
         """Get import statements for code files."""
