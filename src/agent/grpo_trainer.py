@@ -217,6 +217,10 @@ class GRPOTrainer:
                     'pr_id': current_task.pr_id,
                     'attempts': self.stats.total_episodes
                 })
+                
+                # Save milestone checkpoint for solved PR
+                self._save_pr_checkpoint(current_task.pr_id)
+                
                 self.stats.current_pr_idx += 1
             
             # All PRs solved
@@ -813,11 +817,43 @@ Rules:
         if keep_last_n > 0:
             self._cleanup_old_checkpoints(keep_last_n)
     
+    def _save_pr_checkpoint(self, pr_id: str):
+        """Save a milestone checkpoint when a PR is solved. These are never auto-cleaned."""
+        import json
+        
+        # Normalise PR id for directory name (e.g. "PR-001" -> "pr_001")
+        safe_name = pr_id.lower().replace("-", "_")
+        checkpoint_path = self.checkpoint_dir / f"solved_{safe_name}_step_{self.stats.total_steps}"
+        checkpoint_path.mkdir(parents=True, exist_ok=True)
+        
+        # Save model
+        self.policy.save(str(checkpoint_path / "model"))
+        
+        # Save stats + PR metadata
+        with open(checkpoint_path / "stats.json", 'w') as f:
+            json.dump({
+                **self.stats.to_dict(),
+                'solved_pr': pr_id,
+                'milestone': True,
+            }, f, indent=2)
+        
+        logger.info(f"🏆 PR milestone checkpoint saved: {checkpoint_path}")
+        self._broadcast({
+            'type': 'checkpoint',
+            'path': str(checkpoint_path),
+            'step': self.stats.total_steps,
+            'milestone': True,
+            'pr_id': pr_id,
+        })
+    
     def _cleanup_old_checkpoints(self, keep_last_n: int):
-        """Remove old checkpoints, keeping only the most recent N."""
+        """Remove old checkpoints, keeping only the most recent N.
+        
+        Milestone checkpoints (solved_*) are never deleted.
+        """
         import shutil
         
-        # Find all checkpoint directories (step_*)
+        # Find only regular step checkpoints (step_*), skip milestones (solved_*)
         checkpoints = sorted(
             [d for d in self.checkpoint_dir.iterdir() if d.is_dir() and d.name.startswith("step_")],
             key=lambda d: int(d.name.split("_")[1]) if d.name.split("_")[1].isdigit() else 0
