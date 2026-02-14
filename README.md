@@ -1,6 +1,6 @@
 # Code-RL-Ground
 
-![ui preview](./asset/asset_1.png)
+![ui preview](./asset/asset1.png)
 
 An RL-based code learning environment where a small language model learns to master a repository by solving PRs sequentially using **GRPO (Group Relative Policy Optimization)** with LoRA fine-tuning.
 
