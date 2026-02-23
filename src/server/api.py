@@ -13,11 +13,26 @@ from typing import Dict, Any, Optional, List
 from datetime import datetime
 import json
 
+import math
+
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
+
+
+def _sanitize_floats(obj):
+    """Recursively replace inf/nan floats with None so JSON serialization succeeds."""
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    if isinstance(obj, dict):
+        return {k: _sanitize_floats(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_floats(v) for v in obj]
+    return obj
 
 from .websocket import WebSocketManager
 from ..utils.config import load_config, Config
@@ -180,7 +195,7 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
             current_episode=state.training_stats.get('total_episodes', 0),
             current_pr=state.training_stats.get('current_pr_id'),
             solved_prs=state.training_stats.get('solved_prs', []),
-            avg_reward=state.training_stats.get('avg_reward', 0.0),
+            avg_reward=_sanitize_floats(state.training_stats.get('avg_reward', 0.0)),
             elapsed_time=elapsed,
             device=device
         )
@@ -208,7 +223,7 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
                 description=task.description,
                 difficulty=task.difficulty,
                 status=status,
-                best_reward=best_rewards.get(task.pr_id, 0.0),
+                best_reward=_sanitize_floats(best_rewards.get(task.pr_id, 0.0)),
                 attempts=attempts_per_pr.get(task.pr_id, 0)
             ))
         
@@ -380,7 +395,7 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
     @app.get("/api/logs")
     async def get_logs(limit: int = 100):
         """Get recent logs."""
-        return state.recent_logs[-limit:]
+        return _sanitize_floats(state.recent_logs[-limit:])
     
     @app.get("/api/metrics")
     async def get_metrics():
@@ -411,10 +426,10 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
                     'solved': log.get('solved', False)
                 })
         
-        return {
+        return _sanitize_floats({
             'steps': steps[-100:],
             'episodes': rewards[-100:]
-        }
+        })
     
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):

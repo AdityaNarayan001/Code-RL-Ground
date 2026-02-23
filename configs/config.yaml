@@ -27,26 +27,15 @@ model:
 
 # RL Training Configuration
 training:
-  algorithm: "grpo"  # ppo, grpo, reinforce
+  algorithm: "grpo"  # Only grpo is supported
   learning_rate: 1.0e-5
-  batch_size: 4
-  gradient_accumulation_steps: 4
-  epochs_per_pr: 10
-  max_episodes: 1000
+  max_episodes: 1000  # Global episode budget (safety valve)
   
   # GRPO specific (Group Relative Policy Optimization)
   grpo:
     group_size: 4  # Number of completions per prompt
     beta: 0.1  # KL penalty coefficient
     clip_range: 0.2
-    
-  # PPO specific (legacy)
-  ppo:
-    clip_range: 0.2
-    value_loss_coef: 0.5
-    entropy_coef: 0.01
-    gamma: 0.99
-    gae_lambda: 0.95
     
   # LoRA configuration
   lora:
@@ -161,7 +150,6 @@ model_saving:
   save_final: true
   final_model_path: "./checkpoints/final_model"
   save_on_mastery: true  # Also save when mastery achieved
-  save_format: "safetensors"  # safetensors or pytorch
 
 # Logging & Monitoring
 logging:

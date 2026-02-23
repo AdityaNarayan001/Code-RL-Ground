@@ -16,6 +16,9 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
 import uuid
+import json
+import shutil
+import traceback
 
 from ..utils.config import Config
 from ..utils.logging import TrainingLogger, get_logger
@@ -29,12 +32,18 @@ logger = get_logger(__name__)
 
 
 @dataclass
+class TurnData:
+    """Data from a single turn within a multi-turn episode."""
+    prompt_ids: torch.Tensor     # (prompt_len,) - full prompt for this turn
+    response_ids: torch.Tensor   # (response_len,) - response tokens
+    old_log_probs: torch.Tensor  # (response_len,) - per-token log probs from generation
+
+
+@dataclass
 class RolloutData:
-    """Data from a single rollout."""
-    prompt_ids: torch.Tensor          # (prompt_len,)
-    response_ids: torch.Tensor        # (response_len,)
-    response_mask: torch.Tensor       # (response_len,) - 1 for valid tokens
-    old_log_probs: torch.Tensor       # (response_len,) - per-token log probs
+    """Data from a single rollout (multi-turn episode)."""
+    turns: List[TurnData]             # Per-turn prompt/response pairs
+    response_mask: torch.Tensor       # (total_response_len,) - 1 for valid tokens
     reward: float                     # scalar outcome reward
     solved: bool
     group_id: str                     # to group responses from same prompt
@@ -63,9 +72,28 @@ class TrainingStats:
             'consecutive_solves': self.consecutive_solves,
             'best_rewards': self.best_rewards,
             'solved_prs': self.solved_prs,
+            'recent_rewards': list(self.recent_rewards),
             'avg_reward': np.mean(list(self.recent_rewards)) if self.recent_rewards else 0.0,
             'attempts_per_pr': self.attempts_per_pr
         }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'TrainingStats':
+        """Restore TrainingStats from a serialised dict (round-trip safe)."""
+        stats = cls(
+            total_steps=data.get('total_steps', 0),
+            total_episodes=data.get('total_episodes', 0),
+            current_pr_idx=data.get('current_pr_idx', 0),
+            current_pr_id=data.get('current_pr_id', ''),
+            consecutive_solves=data.get('consecutive_solves', 0),
+            best_rewards=data.get('best_rewards', {}),
+            solved_prs=data.get('solved_prs', []),
+            attempts_per_pr=data.get('attempts_per_pr', {}),
+        )
+        # Restore recent_rewards as deque
+        for r in data.get('recent_rewards', []):
+            stats.recent_rewards.append(r)
+        return stats
 
 
 class GRPOTrainer:
@@ -108,6 +136,17 @@ class GRPOTrainer:
             lr=self.learning_rate
         )
         
+        # Cosine LR scheduler with warmup
+        # Total budget: max_episodes / group_size gives approximate total steps
+        estimated_total_steps = max(self.train_config.max_episodes // self.group_size, 500)
+        warmup_steps = min(50, estimated_total_steps // 10)
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer,
+            T_max=estimated_total_steps - warmup_steps,
+            eta_min=self.learning_rate * 0.1
+        )
+        self.warmup_steps = warmup_steps
+        
         # Stats
         self.stats = TrainingStats()
         
@@ -115,7 +154,7 @@ class GRPOTrainer:
         self.exp_logger: Optional[ExperimentLogger] = None
         
         # Legacy logger for backward compat
-        self.logger = training_logger or TrainingLogger(config)
+        self.logger = training_logger or TrainingLogger(name="grpo_trainer")
         
         # Checkpointing
         self.checkpoint_dir = config.checkpoints_path
@@ -195,14 +234,57 @@ class GRPOTrainer:
                         })
                         return {'stats': self.stats.to_dict()}
                     
+                    # Global episode budget guard
+                    if self.stats.total_episodes >= self.train_config.max_episodes:
+                        logger.warning(
+                            f"Global episode budget exhausted ({self.train_config.max_episodes}). "
+                            f"Stopping training."
+                        )
+                        self._broadcast({
+                            'type': 'info',
+                            'message': f'Episode budget exhausted ({self.train_config.max_episodes})'
+                        })
+                        return {'stats': self.stats.to_dict()}
+                    
+                    # Per-PR attempt guard (safety valve)
+                    pr_attempts = self.stats.attempts_per_pr.get(current_task.pr_id, 0)
+                    max_attempts = self.curriculum_config.max_attempts_per_pr
+                    if pr_attempts >= max_attempts:
+                        logger.warning(
+                            f"{current_task.pr_id} hit max attempts ({max_attempts}). "
+                            f"Forcing advancement."
+                        )
+                        self._broadcast({
+                            'type': 'info',
+                            'message': f'{current_task.pr_id} skipped after {max_attempts} attempts'
+                        })
+                        break  # Break inner loop, advance to next PR
+                    
                     # Collect rollouts (group of completions)
                     rollouts = self._collect_rollouts(current_task)
                     
                     # Compute group-relative advantages
                     self._compute_advantages(rollouts)
                     
-                    # GRPO policy update
-                    update_stats = self._grpo_update(rollouts)
+                    # GRPO policy update (with OOM guard)
+                    try:
+                        update_stats = self._grpo_update(rollouts)
+                    except RuntimeError as e:
+                        if 'out of memory' in str(e).lower() or 'MPS' in str(e):
+                            logger.error(f"OOM during GRPO update at step {self.stats.total_steps}: {e}")
+                            # Clear caches and gradients
+                            self.optimizer.zero_grad()
+                            if self.device.type == 'mps':
+                                torch.mps.empty_cache()
+                            elif self.device.type == 'cuda':
+                                torch.cuda.empty_cache()
+                            # Save emergency checkpoint
+                            try:
+                                self._save_checkpoint()
+                            except Exception:
+                                pass
+                            raise  # Re-raise so the user sees it
+                        raise
                     
                     # Log progress
                     self._log_progress(rollouts, update_stats)
@@ -210,6 +292,12 @@ class GRPOTrainer:
                     # Checkpoint
                     if self.stats.total_steps % self.train_config.checkpointing.save_every_n_steps == 0:
                         self._save_checkpoint()
+                    
+                    # Periodic mastery evaluation
+                    if (self.config.mastery.enabled and
+                        self.config.mastery.eval_frequency > 0 and
+                        self.stats.total_steps % self.config.mastery.eval_frequency == 0):
+                        self._run_mastery_eval()
                 
                 # PR solved - advance
                 self._broadcast({
@@ -223,16 +311,23 @@ class GRPOTrainer:
                 
                 self.stats.current_pr_idx += 1
             
-            # All PRs solved
+            # All PRs solved — run championship round if enabled
+            championship_result = None
+            if self.config.championship.enabled:
+                championship_result = self._run_championship()
+            
+            result = {'stats': self.stats.to_dict()}
+            if championship_result:
+                result['championship'] = championship_result
+            
             self._broadcast({
                 'type': 'training_complete',
-                'result': {'stats': self.stats.to_dict()}
+                'result': result
             })
-            return {'stats': self.stats.to_dict()}
+            return result
             
         except Exception as e:
             logger.error(f"Training error: {e}")
-            import traceback
             self._broadcast({
                 'type': 'training_error', 
                 'error': str(e),
@@ -256,13 +351,18 @@ class GRPOTrainer:
         
         # Generate K episode rollouts
         for i in range(self.group_size):
+          try:
             # Reset for new episode
             self.policy.reset_conversation()
             obs = self.env.reset(task.data, task.depends_on)
             
+            # Track episode in experiment logger
+            episode_num = self.stats.total_episodes + 1
+            if self.exp_logger:
+                self.exp_logger.start_episode(episode_num, task.pr_id)
+            
             # Collect all tokens and log probs across the episode
-            all_response_ids = []
-            all_log_probs = []
+            turn_data_list: List[TurnData] = []
             all_prompts = []
             
             # Track conversation for multi-turn
@@ -301,26 +401,29 @@ class GRPOTrainer:
                     'full_text': output.text
                 })
                 
-                # Collect tokens and log probs
+                # Collect tokens and log probs for this turn
                 response_ids = torch.tensor(output.token_ids, device=self.device)
-                all_response_ids.append(response_ids)
+                
+                # Get the prompt_ids for this specific turn
+                turn_prompt_ids = self.policy.tokenizer(
+                    current_prompt, return_tensors="pt", truncation=True
+                )['input_ids'][0]
                 
                 # Get log probs for this turn's tokens
                 if output.log_probs is not None:
-                    prompt_ids = self.policy.tokenizer(
-                        current_prompt, return_tensors="pt", truncation=True
-                    )['input_ids'][0]
                     if len(output.log_probs.shape) > 1:
                         lp = self._gather_token_log_probs(output.log_probs, response_ids)
                     else:
                         lp = output.log_probs
-                    all_log_probs.append(lp)
                 else:
-                    prompt_ids = self.policy.tokenizer(
-                        current_prompt, return_tensors="pt", truncation=True
-                    )['input_ids'][0]
-                    lp = self._compute_token_log_probs(prompt_ids, response_ids)
-                    all_log_probs.append(lp)
+                    lp = self._compute_token_log_probs(turn_prompt_ids, response_ids)
+                
+                # Store per-turn data (prompt + response + log probs)
+                turn_data_list.append(TurnData(
+                    prompt_ids=turn_prompt_ids.to(self.device),
+                    response_ids=response_ids,
+                    old_log_probs=lp.detach()
+                ))
                 
                 # Execute action in environment
                 action = self.env.parse_action(output.text)
@@ -340,13 +443,26 @@ class GRPOTrainer:
                 
                 # Broadcast tool result
                 if action.tool_name:
+                    tool_success = obs.info.get('success', True) if obs.info else True
                     self._broadcast({
                         'type': 'tool_result',
                         'tool': action.tool_name,
-                        'success': obs.info.get('success', True) if obs.info else True,
+                        'success': tool_success,
                         'output': obs.content[:200] if obs.content else '',
                         'terminal': terminal
                     })
+                    # Log tool call in experiment logger
+                    if self.exp_logger:
+                        self.exp_logger.log_tool_call(
+                            tool=action.tool_name,
+                            args=action.tool_args or {},
+                            result=obs.content[:500] if obs.content else '',
+                            success=tool_success
+                        )
+                
+                # Log generation in experiment logger
+                if self.exp_logger:
+                    self.exp_logger.log_generation(output.text, turn)
                 
                 # Add to conversation history
                 conversation_history.append({
@@ -364,6 +480,9 @@ class GRPOTrainer:
             task_reward = episode.total_reward if episode else 0.0
             solved = episode.solved if episode else False
             
+            # Clean up working directory from this episode to prevent disk leak
+            self.env.cleanup()
+            
             # Compute format shaping reward (dense signal for cold-start)
             assistant_outputs = [h['content'] for h in conversation_history if h['role'] == 'assistant']
             format_reward = self.format_scorer.score_episode(
@@ -374,21 +493,28 @@ class GRPOTrainer:
             # Combined reward: task reward + format shaping (clamped to [0, 1])
             reward = min(1.0, task_reward + format_reward)
             
-            # Concatenate all response tokens
-            if all_response_ids:
-                combined_response_ids = torch.cat(all_response_ids)
-                combined_log_probs = torch.cat(all_log_probs)
-                response_mask = torch.ones(len(combined_response_ids), device=self.device)
-            else:
-                combined_response_ids = torch.zeros(1, dtype=torch.long, device=self.device)
-                combined_log_probs = torch.zeros(1, device=self.device)
-                response_mask = torch.zeros(1, device=self.device)
+            # Log episode end in experiment logger
+            if self.exp_logger:
+                self.exp_logger.end_episode(
+                    reward=reward,
+                    solved=solved,
+                    num_turns=turn,
+                    error=None
+                )
+                # Also log the breakdown as extra metrics
+                self.exp_logger.log_metrics({
+                    'task_reward': task_reward,
+                    'format_reward': format_reward,
+                    'combined_reward': reward,
+                    'num_turns': float(turn),
+                }, step=self.stats.total_steps, episode=self.stats.total_episodes + 1)
             
-            # Use first prompt's token ids as base (for advantage computation)
-            first_prompt = all_prompts[0] if all_prompts else ""
-            prompt_ids = self.policy.tokenizer(
-                first_prompt, return_tensors="pt", truncation=True
-            )['input_ids'][0]
+            # Compute response mask (all tokens valid)
+            total_response_tokens = sum(td.response_ids.shape[0] for td in turn_data_list)
+            if total_response_tokens > 0:
+                response_mask = torch.ones(total_response_tokens, device=self.device)
+            else:
+                response_mask = torch.zeros(1, device=self.device)
             
             # Broadcast episode completion
             full_conversation = "\n---\n".join([h['content'] for h in conversation_history if h['role'] == 'assistant'])
@@ -405,10 +531,8 @@ class GRPOTrainer:
             })
             
             rollouts.append(RolloutData(
-                prompt_ids=prompt_ids.to(self.device),
-                response_ids=combined_response_ids,
+                turns=turn_data_list,
                 response_mask=response_mask,
-                old_log_probs=combined_log_probs.detach(),
                 reward=reward,
                 solved=solved,
                 group_id=group_id,
@@ -443,6 +567,26 @@ class GRPOTrainer:
                 'turns': turn,
                 'message': f'Episode {self.stats.total_episodes}: {task.pr_id} - R={reward:.2f} ({turn} turns)'
             })
+          except Exception as ep_err:
+            # Per-episode error handling: log and skip, don't kill entire run
+            logger.warning(f"Episode {i+1}/{self.group_size} failed for {task.pr_id}: {ep_err}")
+            self._broadcast({
+                'type': 'warning',
+                'message': f'Episode {i+1} failed: {str(ep_err)[:200]}'
+            })
+            # Log failed episode in experiment logger
+            if self.exp_logger:
+                self.exp_logger.end_episode(
+                    reward=0.0,
+                    solved=False,
+                    num_turns=0,
+                    error=str(ep_err)[:500]
+                )
+            continue
+        
+        # Free rollout-phase memory before GRPO update
+        if self.device.type == 'mps':
+            torch.mps.empty_cache()
         
         return rollouts
     
@@ -502,13 +646,11 @@ class GRPOTrainer:
         log_probs = log_probs.to(self.device)
         token_ids = token_ids.to(self.device)
         
-        # Gather: for each position, get log prob of the actual token
+        # Vectorized gather: for each position, get log prob of the actual token
         seq_len = min(log_probs.shape[0], token_ids.shape[0])
-        gathered = torch.zeros(seq_len, device=self.device)
-        
-        for i in range(seq_len):
-            if i < log_probs.shape[0] and token_ids[i] < log_probs.shape[1]:
-                gathered[i] = log_probs[i, token_ids[i]]
+        log_probs = log_probs[:seq_len]
+        ids = token_ids[:seq_len].clamp(0, log_probs.shape[1] - 1)
+        gathered = log_probs[torch.arange(seq_len, device=self.device), ids]
         
         return gathered
     
@@ -577,90 +719,180 @@ class GRPOTrainer:
                 rollout.advantage = normalized[i].item()
     
     def _grpo_update(self, rollouts: List[RolloutData]) -> Dict[str, float]:
-        """Perform GRPO policy update using token-level computation."""
+        """Perform GRPO policy update using token-level computation.
+        
+        Correctly handles multi-turn episodes by recomputing log probs
+        per-turn with the matching prompt context.
+        
+        Uses per-turn micro-backward to keep only 1 forward pass's
+        computation graph in memory at a time (prevents MPS OOM).
+        """
         self.optimizer.zero_grad()
         
-        total_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+        # Count total items for averaging the accumulated gradients
+        num_rollouts = len(rollouts)
+        total_turns_processed = 0
+        
+        # Stats accumulators (no gradients needed for these)
         total_pg_loss = 0.0
         total_kl = 0.0
+        total_entropy = 0.0
         total_tokens = 0
         clip_fracs = []
+        all_ratios = []
+        all_advantages = []
+        accumulated_loss = 0.0  # scalar for logging
         
         for rollout in rollouts:
-            # Recompute log probs under current policy (with gradients)
-            new_log_probs = self._compute_token_log_probs_with_grad(
-                rollout.prompt_ids,
-                rollout.response_ids
-            )
-            
-            # Align lengths
-            min_len = min(new_log_probs.shape[0], rollout.old_log_probs.shape[0])
-            if min_len == 0:
-                continue
-                
-            new_lp = new_log_probs[:min_len]
-            old_lp = rollout.old_log_probs[:min_len].to(self.device)
-            mask = rollout.response_mask[:min_len].to(self.device)
-            
-            # Compute ratio per token
-            ratio = torch.exp(new_lp - old_lp)
-            
-            # Advantage (same for all tokens in this response)
             advantage = rollout.advantage
+            rollout_pg_stat = 0.0
+            rollout_kl_stat = 0.0
+            rollout_tokens = 0
+            rollout_entropy = 0.0
+            rollout_clip_count = 0.0
+            rollout_total_clip_denom = 0.0
+            turn_ratios = []
             
-            # Clipped surrogate objective (per token)
-            surr1 = ratio * advantage
-            surr2 = torch.clamp(ratio, 1 - self.clip_range, 1 + self.clip_range) * advantage
-            pg_loss_tokens = -torch.min(surr1, surr2)
+            for turn in rollout.turns:
+                # Recompute log probs for THIS turn with its correct prompt context
+                new_log_probs = self._compute_token_log_probs_with_grad(
+                    turn.prompt_ids,
+                    turn.response_ids
+                )
+                
+                # Align lengths (should match, but be safe)
+                min_len = min(new_log_probs.shape[0], turn.old_log_probs.shape[0])
+                if min_len == 0:
+                    continue
+                
+                new_lp = new_log_probs[:min_len]
+                old_lp = turn.old_log_probs[:min_len].to(self.device)
+                mask = torch.ones(min_len, device=self.device)
+                n_tokens = mask.sum()
+                
+                # Compute ratio per token
+                ratio = torch.exp(new_lp - old_lp)
+                
+                # Clipped surrogate objective (per token)
+                surr1 = ratio * advantage
+                surr2 = torch.clamp(ratio, 1 - self.clip_range, 1 + self.clip_range) * advantage
+                pg_loss_tokens = -torch.min(surr1, surr2)
+                
+                # Mean over tokens in this turn
+                turn_pg = (pg_loss_tokens * mask).sum() / (n_tokens + 1e-8)
+                
+                # KL penalty per turn — clamped to prevent explosion
+                log_ratio = old_lp - new_lp
+                log_ratio_clamped = torch.clamp(log_ratio, -5.0, 5.0)
+                kl_tokens = torch.exp(log_ratio_clamped) - 1.0 - log_ratio_clamped
+                turn_kl = (kl_tokens * mask).sum() / (n_tokens + 1e-8)
+                
+                # This turn's loss
+                turn_loss = turn_pg + self.beta * turn_kl
+                
+                # Scale by token weight relative to total, divided by num_rollouts
+                # so the accumulated gradient ~ mean over rollouts of mean over tokens
+                # We'll do a simple: backward(loss / num_rollouts) per turn
+                # and gradient = sum of these = mean-of-rollouts loss
+                scaled_loss = turn_loss / num_rollouts
+                
+                # ---- MICRO BACKWARD: free this turn's graph immediately ----
+                scaled_loss.backward()
+                # After backward(), the computation graph from this forward pass
+                # is freed, keeping peak memory = 1 forward pass at a time.
+                
+                total_turns_processed += 1
+                
+                # Accumulate scalar stats (detached, no graph)
+                with torch.no_grad():
+                    rollout_pg_stat += turn_pg.item() * n_tokens.item()
+                    rollout_kl_stat += turn_kl.item() * n_tokens.item()
+                    rollout_tokens += n_tokens.item()
+                    accumulated_loss += turn_loss.item()
+                    
+                    # Entropy proxy
+                    token_entropy = -(new_lp * mask).sum() / (n_tokens + 1e-8)
+                    rollout_entropy += token_entropy.item() * n_tokens.item()
+                    
+                    # Clip fraction
+                    clipped = (surr2 > surr1).float()
+                    rollout_clip_count += (clipped * mask).sum().item()
+                    rollout_total_clip_denom += n_tokens.item()
+                    
+                    # Ratio for diagnostics
+                    turn_ratios.append((ratio * mask).sum().item() / (n_tokens.item() + 1e-8))
+                
+                # Explicitly free MPS memory after each turn
+                del new_log_probs, new_lp, old_lp, mask, ratio, surr1, surr2
+                del pg_loss_tokens, turn_pg, kl_tokens, turn_kl, turn_loss, scaled_loss
+                if self.device.type == 'mps':
+                    torch.mps.empty_cache()
             
-            # Masked mean over tokens
-            pg_loss = (pg_loss_tokens * mask).sum() / (mask.sum() + 1e-8)
-            
-            # KL penalty (low-variance version from TinyZero)
-            # KL = old_lp - new_lp (approximation)
-            kl_tokens = old_lp - new_lp
-            kl_loss = (kl_tokens.abs() * mask).sum() / (mask.sum() + 1e-8)
-            
-            # Combined loss
-            loss = pg_loss + self.beta * kl_loss
-            total_loss = total_loss + loss
-            
-            # Stats
-            total_pg_loss += pg_loss.detach().item()
-            total_kl += kl_loss.detach().item()
-            total_tokens += mask.sum().item()
-            
-            # Clip fraction
-            clipped = (surr2 > surr1).float()
-            clip_fracs.append((clipped * mask).sum().item() / (mask.sum().item() + 1e-8))
-        
-        # Average over rollouts
-        num_rollouts = len(rollouts)
-        if num_rollouts > 0:
-            total_loss = total_loss / num_rollouts
-        
-        # Backward
-        total_loss.backward()
+            # Rollout-level stats
+            if rollout_tokens > 0:
+                total_pg_loss += rollout_pg_stat / rollout_tokens
+                total_kl += rollout_kl_stat / rollout_tokens
+                total_tokens += rollout_tokens
+                total_entropy += rollout_entropy / rollout_tokens
+                
+                clip_fracs.append(rollout_clip_count / (rollout_total_clip_denom + 1e-8))
+                all_ratios.append(np.mean(turn_ratios) if turn_ratios else 1.0)
+                all_advantages.append(advantage)
         
         # Gradient clipping (only trainable parameters)
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            [p for p in self.policy.model.parameters() if p.requires_grad], 1.0
-        )
+        trainable_params = [p for p in self.policy.model.parameters() if p.requires_grad]
+        grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+        
+        # NaN guard: skip optimizer step if gradients exploded
+        grad_norm_val = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+        if not np.isfinite(grad_norm_val):
+            logger.warning(f"Step {self.stats.total_steps}: NaN/Inf grad_norm ({grad_norm_val}), skipping optimizer step")
+            self.optimizer.zero_grad()
+            self.stats.total_steps += 1
+            return {
+                'loss': 0.0, 'pg_loss': 0.0, 'kl_loss': total_kl / max(num_rollouts, 1),
+                'entropy': 0.0, 'clip_frac': 0.0, 'grad_norm': 0.0,
+                'learning_rate': self.optimizer.param_groups[0]['lr'],
+                'mean_reward': np.mean([r.reward for r in rollouts]),
+                'max_reward': max(r.reward for r in rollouts),
+                'min_reward': min(r.reward for r in rollouts),
+                'solve_rate': sum(1 for r in rollouts if r.solved) / len(rollouts),
+                'mean_advantage': 0.0, 'mean_ratio': 1.0,
+                'num_tokens': int(total_tokens), 'num_rollouts': num_rollouts,
+                'skipped': True
+            }
         
         # Optimizer step
         self.optimizer.step()
         
+        # LR scheduler step (with linear warmup)
+        if self.stats.total_steps < self.warmup_steps:
+            warmup_factor = (self.stats.total_steps + 1) / self.warmup_steps
+            for pg in self.optimizer.param_groups:
+                pg['lr'] = self.learning_rate * warmup_factor
+        else:
+            self.scheduler.step()
+        
         self.stats.total_steps += 1
         
+        current_lr = self.optimizer.param_groups[0]['lr']
+        
         return {
-            'loss': total_loss.detach().item(),
+            'loss': accumulated_loss / max(num_rollouts, 1),
             'pg_loss': total_pg_loss / max(num_rollouts, 1),
             'kl_loss': total_kl / max(num_rollouts, 1),
+            'entropy': total_entropy / max(num_rollouts, 1),
             'clip_frac': np.mean(clip_fracs) if clip_fracs else 0.0,
-            'grad_norm': grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
+            'grad_norm': grad_norm_val,
+            'learning_rate': current_lr,
             'mean_reward': np.mean([r.reward for r in rollouts]),
             'max_reward': max(r.reward for r in rollouts),
-            'solve_rate': sum(1 for r in rollouts if r.solved) / len(rollouts)
+            'min_reward': min(r.reward for r in rollouts),
+            'solve_rate': sum(1 for r in rollouts if r.solved) / len(rollouts),
+            'mean_advantage': np.mean(all_advantages) if all_advantages else 0.0,
+            'mean_ratio': np.mean(all_ratios) if all_ratios else 1.0,
+            'num_tokens': int(total_tokens),
+            'num_rollouts': num_rollouts
         }
     
     def _compute_token_log_probs_with_grad(
@@ -668,36 +900,46 @@ class GRPOTrainer:
         prompt_ids: torch.Tensor,
         response_ids: torch.Tensor
     ) -> torch.Tensor:
-        """Compute per-token log probs WITH gradients for policy update."""
-        # Ensure both tensors are on the same device
+        """Compute per-token log probs WITH gradients for policy update.
+        
+        Memory-optimised: only computes log_softmax over the response
+        positions rather than the full sequence.
+        """
         prompt_ids = prompt_ids.to(self.device)
         response_ids = response_ids.to(self.device)
         
-        # Concatenate prompt and response
         full_ids = torch.cat([prompt_ids, response_ids]).unsqueeze(0)
+        prompt_len = prompt_ids.shape[0]
+        resp_len = response_ids.shape[0]
+        
+        if resp_len == 0:
+            return torch.zeros(1, device=self.device, requires_grad=True)
         
         # Forward pass (WITH gradients)
         outputs = self.policy.model(full_ids)
-        logits = outputs.logits[0]  # (seq_len, vocab_size)
         
-        # Get log probs
-        log_probs = F.log_softmax(logits, dim=-1)
+        # Slice logits to only the positions that predict response tokens
+        # Position (prompt_len - 1) predicts response_ids[0],
+        # Position (prompt_len + resp_len - 2) predicts response_ids[-1]
+        start_pos = max(prompt_len - 1, 0)
+        end_pos = prompt_len + resp_len - 1  # exclusive end
+        resp_logits = outputs.logits[0, start_pos:end_pos, :]  # (resp_len, vocab)
         
-        # Extract log probs for response tokens
-        prompt_len = prompt_ids.shape[0]
-        response_log_probs = []
+        # Drop reference to full logits to free memory
+        del outputs
         
-        for i in range(len(response_ids)):
-            # Log prob at position (prompt_len + i - 1) predicts token at (prompt_len + i)
-            pos = prompt_len + i - 1
-            if pos >= 0 and pos < logits.shape[0]:
-                token_id = response_ids[i]
-                lp = log_probs[pos, token_id]
-                response_log_probs.append(lp)
+        # log_softmax only over response positions → much smaller allocation
+        resp_log_probs = F.log_softmax(resp_logits, dim=-1)  # (resp_len, vocab)
+        del resp_logits
         
-        if response_log_probs:
-            return torch.stack(response_log_probs)
-        return torch.zeros(1, device=self.device, requires_grad=True)
+        # Gather the log probs for the actual response token ids
+        token_log_probs = resp_log_probs[
+            torch.arange(resp_len, device=self.device),
+            response_ids[:resp_len]
+        ]
+        del resp_log_probs
+        
+        return token_log_probs
     
     def _is_pr_solved(self, pr_id: str) -> bool:
         """Check if PR is considered solved."""
@@ -759,12 +1001,23 @@ Rules:
                 loss=update_stats['loss'],
                 pg_loss=update_stats['pg_loss'],
                 kl_loss=update_stats['kl_loss'],
+                entropy=update_stats.get('entropy', 0),
                 grad_norm=update_stats.get('grad_norm', 0),
+                learning_rate=update_stats.get('learning_rate', 0),
                 clip_frac=update_stats['clip_frac'],
                 mean_reward=update_stats['mean_reward'],
                 max_reward=update_stats['max_reward'],
                 solve_rate=update_stats['solve_rate'],
-                num_episodes=len(rollouts)
+                num_episodes=len(rollouts),
+                extra={
+                    'min_reward': update_stats.get('min_reward', 0),
+                    'mean_advantage': update_stats.get('mean_advantage', 0),
+                    'mean_ratio': update_stats.get('mean_ratio', 1.0),
+                    'num_tokens': update_stats.get('num_tokens', 0),
+                    'num_rollouts': update_stats.get('num_rollouts', 0),
+                    'pr_id': self.stats.current_pr_id,
+                    'avg_reward_100': np.mean(list(self.stats.recent_rewards)) if self.stats.recent_rewards else 0
+                }
             )
         else:
             # Fallback to simple broadcast
@@ -775,10 +1028,15 @@ Rules:
                     'loss': update_stats['loss'],
                     'pg_loss': update_stats['pg_loss'],
                     'kl_loss': update_stats['kl_loss'],
+                    'entropy': update_stats.get('entropy', 0),
                     'clip_frac': update_stats['clip_frac'],
+                    'learning_rate': update_stats.get('learning_rate', 0),
                     'mean_reward': update_stats['mean_reward'],
                     'max_reward': update_stats['max_reward'],
+                    'min_reward': update_stats.get('min_reward', 0),
                     'solve_rate': update_stats['solve_rate'],
+                    'mean_advantage': update_stats.get('mean_advantage', 0),
+                    'mean_ratio': update_stats.get('mean_ratio', 1.0),
                     'avg_reward': np.mean(list(self.stats.recent_rewards)) if self.stats.recent_rewards else 0
                 }
             })
@@ -788,6 +1046,9 @@ Rules:
                     f"Step {self.stats.total_steps} | "
                     f"PR: {self.stats.current_pr_id} | "
                     f"Loss: {update_stats['loss']:.4f} | "
+                    f"PG: {update_stats['pg_loss']:.4f} | "
+                    f"KL: {update_stats['kl_loss']:.4f} | "
+                    f"LR: {update_stats.get('learning_rate', 0):.2e} | "
                     f"Reward: {update_stats['mean_reward']:.3f} | "
                     f"Solve: {update_stats['solve_rate']:.1%}"
                 )
@@ -801,9 +1062,16 @@ Rules:
         self.policy.save(str(checkpoint_path / "model"))
         
         # Save stats
-        import json
         with open(checkpoint_path / "stats.json", 'w') as f:
             json.dump(self.stats.to_dict(), f, indent=2)
+        
+        # Save optimizer state
+        if self.train_config.checkpointing.save_optimizer:
+            torch.save(self.optimizer.state_dict(), checkpoint_path / "optimizer.pt")
+        
+        # Save scheduler state
+        if self.train_config.checkpointing.save_scheduler:
+            torch.save(self.scheduler.state_dict(), checkpoint_path / "scheduler.pt")
         
         logger.info(f"Checkpoint saved: {checkpoint_path}")
         self._broadcast({
@@ -819,8 +1087,6 @@ Rules:
     
     def _save_pr_checkpoint(self, pr_id: str):
         """Save a milestone checkpoint when a PR is solved. These are never auto-cleaned."""
-        import json
-        
         # Normalise PR id for directory name (e.g. "PR-001" -> "pr_001")
         safe_name = pr_id.lower().replace("-", "_")
         checkpoint_path = self.checkpoint_dir / f"solved_{safe_name}_step_{self.stats.total_steps}"
@@ -851,8 +1117,6 @@ Rules:
         
         Milestone checkpoints (solved_*) are never deleted.
         """
-        import shutil
-        
         # Find only regular step checkpoints (step_*), skip milestones (solved_*)
         checkpoints = sorted(
             [d for d in self.checkpoint_dir.iterdir() if d.is_dir() and d.name.startswith("step_")],
@@ -867,3 +1131,227 @@ Rules:
                 logger.info(f"Removed old checkpoint: {oldest}")
             except Exception as e:
                 logger.warning(f"Failed to remove checkpoint {oldest}: {e}")
+    
+    def load_checkpoint(self, checkpoint_path: str):
+        """Load a full checkpoint: model weights, optimizer, scheduler, and training stats.
+        
+        Args:
+            checkpoint_path: Path to checkpoint directory or model subdirectory.
+                             Accepts either 'checkpoints/step_100' or 'checkpoints/step_100/model'.
+        """
+        ckpt = Path(checkpoint_path)
+        
+        # If user pointed at the model subdir, go up one level
+        if ckpt.name == "model" and (ckpt.parent / "stats.json").exists():
+            ckpt = ckpt.parent
+        
+        # Load model weights (LoRA adapter)
+        model_path = ckpt / "model"
+        if model_path.exists():
+            self.policy.load_checkpoint(str(model_path))
+            logger.info(f"Restored model from {model_path}")
+        else:
+            # Maybe the path itself IS the model dir
+            self.policy.load_checkpoint(str(ckpt))
+            logger.info(f"Restored model from {ckpt}")
+        
+        # Restore training stats
+        stats_path = ckpt / "stats.json"
+        if stats_path.exists():
+            with open(stats_path, 'r') as f:
+                stats_data = json.load(f)
+            self.stats = TrainingStats.from_dict(stats_data)
+            logger.info(
+                f"Restored stats: step={self.stats.total_steps}, "
+                f"episodes={self.stats.total_episodes}, "
+                f"pr_idx={self.stats.current_pr_idx}, "
+                f"solved={self.stats.solved_prs}"
+            )
+        
+        # Restore optimizer state
+        optimizer_path = ckpt / "optimizer.pt"
+        if optimizer_path.exists():
+            self.optimizer.load_state_dict(torch.load(optimizer_path, map_location=self.device))
+            logger.info("Restored optimizer state")
+        
+        # Restore scheduler state
+        scheduler_path = ckpt / "scheduler.pt"
+        if scheduler_path.exists():
+            self.scheduler.load_state_dict(torch.load(scheduler_path, map_location=self.device))
+            logger.info("Restored scheduler state")
+    
+    def _run_championship(self) -> Dict[str, Any]:
+        """Run championship round: model must solve ALL PRs sequentially from base repo.
+        
+        No retries allowed. This is the final test of mastery.
+        
+        Returns:
+            Dict with championship results.
+        """
+        logger.info("\n" + "=" * 60)
+        logger.info("🏆 CHAMPIONSHIP ROUND")
+        logger.info("=" * 60)
+        self._broadcast({'type': 'info', 'message': '🏆 Starting championship round...'})
+        
+        results = []
+        all_passed = True
+        system_prompt = self._get_system_prompt()
+        max_turns = self.config.environment.max_turns
+        threshold = self.curriculum_config.solve_threshold
+        
+        for task in self.pr_tasks:
+            self.policy.reset_conversation()
+            obs = self.env.reset(task.data, task.depends_on)
+            
+            conversation_history = []
+            turn = 0
+            terminal = False
+            
+            while not terminal and turn < max_turns:
+                turn += 1
+                prompt = self._build_turn_prompt(task, obs, conversation_history, system_prompt)
+                output = self.policy.generate(
+                    prompt,
+                    system_prompt=system_prompt if turn == 1 else None,
+                    return_log_probs=False,
+                    temperature=0.0  # Greedy for championship
+                )
+                
+                action = self.env.parse_action(output.text)
+                obs = self.env.step(action)
+                terminal = obs.is_terminal
+                
+                conversation_history.append({'role': 'assistant', 'content': output.text})
+                if not terminal:
+                    conversation_history.append({'role': 'user', 'content': obs.content})
+            
+            episode = self.env.get_episode()
+            reward = episode.total_reward if episode else 0.0
+            passed = reward >= threshold
+            
+            if not passed:
+                all_passed = False
+            
+            results.append({
+                'pr_id': task.pr_id,
+                'reward': reward,
+                'passed': passed,
+                'turns': turn,
+            })
+            
+            status = '✅' if passed else '❌'
+            logger.info(f"  {status} {task.pr_id}: reward={reward:.3f} ({turn} turns)")
+            self._broadcast({
+                'type': 'championship_pr',
+                'pr_id': task.pr_id, 'reward': reward,
+                'passed': passed, 'turns': turn,
+            })
+        
+        championship_result = {
+            'passed': all_passed,
+            'results': results,
+            'prs_passed': sum(1 for r in results if r['passed']),
+            'prs_total': len(results),
+        }
+        
+        # Save championship transcript if configured
+        if self.config.championship.save_transcript:
+            transcript_path = self.checkpoint_dir / "championship_transcript.json"
+            with open(transcript_path, 'w') as f:
+                json.dump(championship_result, f, indent=2)
+        
+        status = '🏆 PASSED' if all_passed else '❌ FAILED'
+        logger.info(f"\nChampionship {status}: {championship_result['prs_passed']}/{championship_result['prs_total']} PRs")
+        self._broadcast({
+            'type': 'championship_complete',
+            'result': championship_result
+        })
+        
+        # Log via training logger if available
+        if hasattr(self.logger, 'log_championship'):
+            self.logger.log_championship(championship_result)
+        
+        return championship_result
+    
+    def _run_mastery_eval(self) -> Dict[str, Any]:
+        """Run mastery evaluation: test solved PRs to confirm the model still solves them.
+        
+        This catches catastrophic forgetting — the model might solve PR-003 but
+        forget how to solve PR-001 after further training.
+        
+        Returns:
+            Dict with per-PR mastery results.
+        """
+        mastery_config = self.config.mastery
+        test_config = mastery_config.test_config
+        system_prompt = self._get_system_prompt()
+        max_turns = self.config.environment.max_turns
+        threshold = test_config.success_threshold_per_pr
+        
+        logger.info(f"Running mastery evaluation at step {self.stats.total_steps}...")
+        self._broadcast({'type': 'info', 'message': f'Mastery eval at step {self.stats.total_steps}'})
+        
+        results = {}
+        for task in self.pr_tasks:
+            # Only evaluate solved PRs (no point testing unsolved ones)
+            if task.pr_id not in self.stats.solved_prs:
+                continue
+            
+            successes = 0
+            for attempt in range(test_config.num_attempts_per_pr):
+                self.policy.reset_conversation()
+                obs = self.env.reset(task.data, task.depends_on)
+                conversation_history = []
+                turn = 0
+                terminal = False
+                
+                while not terminal and turn < max_turns:
+                    turn += 1
+                    prompt = self._build_turn_prompt(task, obs, conversation_history, system_prompt)
+                    output = self.policy.generate(
+                        prompt,
+                        system_prompt=system_prompt if turn == 1 else None,
+                        return_log_probs=False,
+                        temperature=0.2  # Low temperature for eval
+                    )
+                    action = self.env.parse_action(output.text)
+                    obs = self.env.step(action)
+                    terminal = obs.is_terminal
+                    conversation_history.append({'role': 'assistant', 'content': output.text})
+                    if not terminal:
+                        conversation_history.append({'role': 'user', 'content': obs.content})
+                
+                episode = self.env.get_episode()
+                reward = episode.total_reward if episode else 0.0
+                self.env.cleanup()
+                
+                if reward >= threshold:
+                    successes += 1
+            
+            results[task.pr_id] = {
+                'successes': successes,
+                'attempts': test_config.num_attempts_per_pr,
+                'pass_rate': successes / test_config.num_attempts_per_pr,
+                'mastered': successes == test_config.num_attempts_per_pr,
+            }
+            
+            status = '✅' if results[task.pr_id]['mastered'] else '⚠️'
+            logger.info(f"  {status} {task.pr_id}: {successes}/{test_config.num_attempts_per_pr}")
+        
+        all_mastered = all(r['mastered'] for r in results.values()) if results else False
+        
+        self._broadcast({
+            'type': 'mastery_eval',
+            'step': self.stats.total_steps,
+            'results': results,
+            'all_mastered': all_mastered,
+        })
+        
+        # Save model on mastery if configured
+        if all_mastered and self.config.model_saving.save_on_mastery:
+            mastery_path = self.checkpoint_dir / f"mastery_step_{self.stats.total_steps}"
+            mastery_path.mkdir(parents=True, exist_ok=True)
+            self.policy.save(str(mastery_path / "model"))
+            logger.info(f"🎓 Mastery checkpoint saved: {mastery_path}")
+        
+        return results

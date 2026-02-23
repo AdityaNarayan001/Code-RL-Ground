@@ -235,8 +235,10 @@ class RewardFunction:
         # Compute similarity
         diff_result = self.diff_scorer.score_content(actual_content, expected_content)
         
-        # Combine scores
-        syntax_score = 0.2
-        similarity_score = 0.8 * diff_result.similarity
+        # Combine scores using partial_credit config weights
+        pc = self.reward_config.partial_credit
+        syntax_weight = 1.0 - pc.line_match_weight  # Complement of line match
+        syntax_score = syntax_weight * (1.0 if syntax_result.valid else 0.0)
+        similarity_score = pc.line_match_weight * diff_result.similarity
         
         return syntax_score + similarity_score

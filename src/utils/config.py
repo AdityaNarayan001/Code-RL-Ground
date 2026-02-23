@@ -185,7 +185,6 @@ class ModelSavingConfig:
     save_final: bool = True
     final_model_path: str = "./checkpoints/final_model"
     save_on_mastery: bool = True
-    save_format: str = "safetensors"
 
 
 @dataclass

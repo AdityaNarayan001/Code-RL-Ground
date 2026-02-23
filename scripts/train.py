@@ -13,6 +13,7 @@ import argparse
 from src.utils.config import load_config
 from src.utils.logging import setup_logging, get_logger
 from src.data import PRLoader, CurriculumManager
+from src.data.augmentation import DataAugmenter
 from src.environment import CodeEnv
 from src.agent import LLMPolicy, GRPOTrainer
 from src.utils.repo_state import RepoStateManager
@@ -73,6 +74,20 @@ def main():
     ordered_tasks = curriculum.get_remaining_tasks()
     logger.info(f"Curriculum order: {[t.pr_id for t in ordered_tasks]}")
 
+    # Data augmentation — expand training set if enabled
+    if config.augmentation.enabled:
+        augmenter = DataAugmenter(seed=config.augmentation.seed)
+        original_count = len(ordered_tasks)
+        ordered_tasks = augmenter.augment_all(
+            ordered_tasks,
+            strategies=config.augmentation.strategies,
+            multiplier=config.augmentation.multiplier
+        )
+        logger.info(
+            f"Data augmentation: {original_count} → {len(ordered_tasks)} tasks "
+            f"(strategies: {config.augmentation.strategies})"
+        )
+
     logger.info("Creating environment...")
     env = CodeEnv(config, repo_manager)
 
@@ -112,12 +127,17 @@ def main():
     result = trainer.train()
 
     # Log final results
+    stats = result.get('stats', result)
     logger.info("=" * 60)
     logger.info("Training Complete!")
-    logger.info(f"  Total steps: {result.get('total_steps', 0)}")
-    logger.info(f"  Total episodes: {result.get('total_episodes', 0)}")
-    logger.info(f"  Solved PRs: {result.get('solved_prs', [])}")
-    logger.info(f"  Championship passed: {result.get('championship_passed', False)}")
+    logger.info(f"  Total steps: {stats.get('total_steps', 0)}")
+    logger.info(f"  Total episodes: {stats.get('total_episodes', 0)}")
+    logger.info(f"  Solved PRs: {stats.get('solved_prs', [])}")
+    
+    championship = result.get('championship', {})
+    if championship:
+        logger.info(f"  Championship passed: {championship.get('passed', False)}")
+        logger.info(f"  Championship PRs: {championship.get('prs_passed', 0)}/{championship.get('prs_total', 0)}")
     logger.info("=" * 60)
 
     # Save final model if configured

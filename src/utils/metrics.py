@@ -13,6 +13,7 @@ Features:
 import csv
 import json
 import logging
+import os
 import sys
 import time
 from collections import defaultdict
@@ -64,8 +65,12 @@ class StepLog:
     clip_frac: float
     mean_reward: float
     max_reward: float
+    min_reward: float
     solve_rate: float
     num_episodes: int
+    mean_advantage: float = 0.0
+    mean_ratio: float = 1.0
+    num_tokens: int = 0
 
 
 class MetricsTracker:
@@ -197,6 +202,14 @@ class ExperimentLogger:
         # Open CSV files for streaming writes
         self._setup_csv_writers()
     
+    def _flush_to_disk(self, file_obj):
+        """Flush file buffer AND force OS to write to disk (survives SIGKILL)."""
+        try:
+            file_obj.flush()
+            os.fsync(file_obj.fileno())
+        except (OSError, ValueError):
+            pass  # File already closed
+    
     def _setup_logger(self, level: str):
         """Setup Python logging."""
         self.logger = logging.getLogger(f"exp.{self.experiment_name}")
@@ -211,11 +224,19 @@ class ExperimentLogger:
         ))
         self.logger.addHandler(console)
         
-        # File handler (JSON)
-        file_handler = logging.FileHandler(self.log_dir / "training.log")
+        # File handler — flush every line so abrupt kills don't lose data
+        log_file_path = self.log_dir / "training.log"
+        file_handler = logging.FileHandler(log_file_path)
         file_handler.setFormatter(logging.Formatter(
             '%(asctime)s | %(levelname)s | %(message)s'
         ))
+        # Force immediate flush on every log record
+        _original_emit = file_handler.emit
+        def _flushing_emit(record, _orig=_original_emit, _fh=file_handler):
+            _orig(record)
+            _fh.stream.flush()
+            os.fsync(_fh.stream.fileno())
+        file_handler.emit = _flushing_emit
         self.logger.addHandler(file_handler)
     
     def _setup_csv_writers(self):
@@ -231,15 +252,17 @@ class ExperimentLogger:
         self.episodes_csv = open(self.log_dir / "episodes.csv", 'w', newline='')
         self.episodes_writer = csv.writer(self.episodes_csv)
         self.episodes_writer.writerow([
-            'episode', 'pr_id', 'reward', 'solved', 'duration', 'num_turns'
+            'episode', 'pr_id', 'reward', 'solved', 'duration', 'num_turns', 'error'
         ])
         
         # Steps CSV
         self.steps_csv = open(self.log_dir / "steps.csv", 'w', newline='')
         self.steps_writer = csv.writer(self.steps_csv)
         self.steps_writer.writerow([
-            'step', 'timestamp', 'loss', 'pg_loss', 'kl_loss', 'grad_norm',
-            'mean_reward', 'max_reward', 'solve_rate', 'clip_frac'
+            'step', 'timestamp', 'loss', 'pg_loss', 'kl_loss', 'entropy', 'grad_norm',
+            'learning_rate', 'mean_reward', 'max_reward', 'min_reward',
+            'solve_rate', 'clip_frac', 'mean_advantage', 'mean_ratio',
+            'num_tokens', 'num_episodes', 'pr_id', 'avg_reward_100'
         ])
     
     def _save_config(self):
@@ -268,7 +291,7 @@ class ExperimentLogger:
         self.metrics_writer.writerow([
             time.time(), step, episode, name, value
         ])
-        self.metrics_csv.flush()
+        self._flush_to_disk(self.metrics_csv)
     
     def log_metrics(self, metrics: Dict[str, float], step: int, episode: int = 0):
         """Log multiple metrics at once."""
@@ -294,6 +317,7 @@ class ExperimentLogger:
         extra: Dict[str, Any] = None
     ):
         """Log a training step."""
+        extra = extra or {}
         step_log = StepLog(
             step=step,
             timestamp=time.time(),
@@ -306,8 +330,12 @@ class ExperimentLogger:
             clip_frac=clip_frac,
             mean_reward=mean_reward,
             max_reward=max_reward,
+            min_reward=extra.get('min_reward', 0),
             solve_rate=solve_rate,
-            num_episodes=num_episodes
+            num_episodes=num_episodes,
+            mean_advantage=extra.get('mean_advantage', 0),
+            mean_ratio=extra.get('mean_ratio', 1.0),
+            num_tokens=extra.get('num_tokens', 0)
         )
         self.steps.append(step_log)
         
@@ -318,23 +346,33 @@ class ExperimentLogger:
             'kl_loss': kl_loss,
             'entropy': entropy,
             'grad_norm': grad_norm,
+            'learning_rate': learning_rate,
             'clip_frac': clip_frac,
             'mean_reward': mean_reward,
             'max_reward': max_reward,
-            'solve_rate': solve_rate
+            'min_reward': extra.get('min_reward', 0),
+            'solve_rate': solve_rate,
+            'mean_advantage': extra.get('mean_advantage', 0),
+            'mean_ratio': extra.get('mean_ratio', 1.0),
         }, step)
         
         # Write to CSV
         self.steps_writer.writerow([
-            step, time.time(), loss, pg_loss, kl_loss, grad_norm,
-            mean_reward, max_reward, solve_rate, clip_frac
+            step, time.time(), loss, pg_loss, kl_loss, entropy, grad_norm,
+            learning_rate, mean_reward, max_reward, extra.get('min_reward', 0),
+            solve_rate, clip_frac, extra.get('mean_advantage', 0),
+            extra.get('mean_ratio', 1.0), extra.get('num_tokens', 0),
+            num_episodes, extra.get('pr_id', ''),
+            extra.get('avg_reward_100', 0)
         ])
-        self.steps_csv.flush()
+        self._flush_to_disk(self.steps_csv)
         
         # Console log (every 10 steps)
         if step % 10 == 0:
             self.logger.info(
                 f"Step {step:5d} | Loss: {loss:.4f} | "
+                f"PG: {pg_loss:.4f} | KL: {kl_loss:.4f} | "
+                f"LR: {learning_rate:.2e} | "
                 f"Reward: {mean_reward:.3f} (max: {max_reward:.3f}) | "
                 f"Solve: {solve_rate:.1%} | Grad: {grad_norm:.3f}"
             )
@@ -347,12 +385,18 @@ class ExperimentLogger:
                 'loss': loss,
                 'pg_loss': pg_loss,
                 'kl_loss': kl_loss,
+                'entropy': entropy,
                 'grad_norm': grad_norm,
+                'learning_rate': learning_rate,
                 'mean_reward': mean_reward,
                 'max_reward': max_reward,
+                'min_reward': extra.get('min_reward', 0),
                 'solve_rate': solve_rate,
                 'clip_frac': clip_frac,
-                'avg_reward': self.metrics.get_mean('mean_reward', 100)
+                'mean_advantage': extra.get('mean_advantage', 0),
+                'mean_ratio': extra.get('mean_ratio', 1.0),
+                'avg_reward': self.metrics.get_mean('mean_reward', 100),
+                'pr_id': extra.get('pr_id', '')
             }
         })
     
@@ -428,9 +472,10 @@ class ExperimentLogger:
             reward,
             solved,
             duration,
-            num_turns
+            num_turns,
+            error or ''
         ])
-        self.episodes_csv.flush()
+        self._flush_to_disk(self.episodes_csv)
         
         # Log metrics
         self.log_metric('episode_reward', reward, 0, episode_log.episode_id)
