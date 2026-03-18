@@ -87,7 +87,8 @@ class CodeEnv:
         self.current_state: Optional[RepoSnapshot] = None
         self.working_dir: Optional[Path] = None
         self.turn_count: int = 0
-        
+        self._is_terminal: bool = False
+
         # Import reward function (delayed to avoid circular import)
         self._reward_fn = None
     
@@ -123,7 +124,11 @@ class CodeEnv:
         
         # Configure tools with working directory
         self.tools.set_working_dir(self.working_dir)
-        
+        self.tools.reset()
+
+        # Reset terminal state
+        self._is_terminal = False
+
         # Store PR data
         self.current_pr_data = pr_data
         
@@ -177,29 +182,42 @@ class CodeEnv:
         Returns:
             Observation after the action
         """
+        # Check if episode has already terminated
+        if self._is_terminal:
+            raise RuntimeError("Cannot step in a terminal state. Call reset() to start a new episode.")
+
         self.turn_count += 1
-        
+
         # Check turn limit
         if self.env_config.mode == "multi_turn" and self.turn_count > self.env_config.max_turns:
-            return self._create_terminal_observation(
+            obs = self._create_terminal_observation(
                 "Maximum turns reached. Episode ending.",
                 force_submit=True
             )
-        
+            self._is_terminal = obs.is_terminal
+            self.current_episode.turns.append((action, obs))
+            return obs
+
         # Process action
         if action.action_type == ActionType.SUBMIT or action.tool_name == "submit":
-            return self._handle_submit()
-        
+            obs = self._handle_submit()
+            self._is_terminal = obs.is_terminal
+            self.current_episode.turns.append((action, obs))
+            return obs
+
         elif action.action_type == ActionType.TOOL_CALL and action.tool_name:
             result = self.tools.execute(action.tool_name, **(action.tool_args or {}))
-            
+
             # Check if this was a submit
             if result.data and result.data.get('action') == 'submit':
-                return self._handle_submit()
-            
+                obs = self._handle_submit()
+                self._is_terminal = obs.is_terminal
+                self.current_episode.turns.append((action, obs))
+                return obs
+
             # Build observation
             obs_content = self._format_tool_result(action.tool_name, result)
-            
+
             obs = Observation(
                 content=obs_content,
                 info={
@@ -208,19 +226,21 @@ class CodeEnv:
                     'success': result.success
                 }
             )
-            
+
             # Record turn
             self.current_episode.turns.append((action, obs))
-            
+
             return obs
-        
+
         else:
             # Text-only response without tool call
-            return Observation(
-                content="Please use a tool to make progress. Available tools: " + 
+            obs = Observation(
+                content="Please use a tool to make progress. Available tools: " +
                        ", ".join(self.tools.tools.keys()),
                 info={'turn': self.turn_count}
             )
+            self.current_episode.turns.append((action, obs))
+            return obs
     
     def _format_tool_result(self, tool_name: str, result: ToolResult) -> str:
         """Format tool result for observation."""
@@ -356,6 +376,13 @@ class CodeEnv:
             self.repo_manager.cleanup_work_dir(self.working_dir)
             self.working_dir = None
     
+    def __del__(self):
+        """Ensure cleanup on garbage collection."""
+        try:
+            self.cleanup()
+        except Exception:
+            pass
+
     def close(self):
         """Close the environment."""
         self.cleanup()

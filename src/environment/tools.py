@@ -1,11 +1,14 @@
 """Tool definitions for the code agent."""
 
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Dict, Any, Callable, Optional, List
 from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -164,6 +167,22 @@ class ToolRegistry:
         self._modifications.clear()
         self._load_file_cache()
     
+    def _validate_path(self, path: str) -> Optional[ToolResult]:
+        """Validate that a path does not escape the working directory.
+
+        Returns a ToolResult with an error if the path is invalid, or None if valid.
+        """
+        if not self.working_dir:
+            return None
+        full_path = (self.working_dir / path).resolve()
+        if not str(full_path).startswith(str(self.working_dir.resolve())):
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Path traversal detected: {path} escapes the working directory"
+            )
+        return None
+
     def _load_file_cache(self):
         """Load all files into cache."""
         if self.working_dir and self.working_dir.exists():
@@ -172,8 +191,10 @@ class ToolRegistry:
                     try:
                         rel_path = str(file_path.relative_to(self.working_dir))
                         self._file_cache[rel_path] = file_path.read_text()
-                    except:
+                    except (UnicodeDecodeError, PermissionError):
                         pass
+                    except Exception as e:
+                        logger.warning(f"Unexpected error loading file {file_path}: {e}")
     
     def get_modifications(self) -> Dict[str, str]:
         """Get all file modifications made during the episode."""
@@ -230,6 +251,11 @@ class ToolRegistry:
     
     def _handle_read_file(self, path: str) -> ToolResult:
         """Handle read_file tool."""
+        # Validate path
+        path_error = self._validate_path(path)
+        if path_error:
+            return path_error
+
         # Check modifications first
         if path in self._modifications:
             return ToolResult(success=True, output=self._modifications[path])
@@ -257,7 +283,13 @@ class ToolRegistry:
     
     def _handle_write_file(self, path: str, content: str) -> ToolResult:
         """Handle write_file tool."""
+        # Validate path
+        path_error = self._validate_path(path)
+        if path_error:
+            return path_error
+
         self._modifications[path] = content
+        self._file_cache[path] = content
         
         # Also write to disk if working_dir is set
         if self.working_dir:
@@ -272,6 +304,11 @@ class ToolRegistry:
     
     def _handle_edit_file(self, path: str, old_content: str, new_content: str) -> ToolResult:
         """Handle edit_file tool."""
+        # Validate path
+        path_error = self._validate_path(path)
+        if path_error:
+            return path_error
+
         # Get current content
         current = self._modifications.get(path) or self._file_cache.get(path)
         
@@ -292,7 +329,8 @@ class ToolRegistry:
         # Perform replacement
         new_file_content = current.replace(old_content, new_content, 1)
         self._modifications[path] = new_file_content
-        
+        self._file_cache[path] = new_file_content
+
         # Write to disk
         if self.working_dir:
             full_path = self.working_dir / path
@@ -305,8 +343,13 @@ class ToolRegistry:
     
     def _handle_list_directory(self, path: str) -> ToolResult:
         """Handle list_directory tool."""
+        # Validate path
+        path_error = self._validate_path(path)
+        if path_error:
+            return path_error
+
         entries = []
-        
+
         if path == "." or path == "":
             # List from all known files
             dirs = set()
@@ -447,8 +490,14 @@ class ToolRegistry:
                 for m in re.finditer(arg_pattern, args_str):
                     key = m.group(1)
                     value = m.group(2) or m.group(3) or m.group(4)
+                    # Type coercion for unquoted values
+                    if m.group(4) is not None:
+                        try:
+                            value = json.loads(value)
+                        except (json.JSONDecodeError, ValueError):
+                            pass
                     args[key] = value
-            except:
-                pass
+            except (re.error, AttributeError) as e:
+                logger.warning(f"Failed to parse tool arguments '{args_str}': {e}")
         
         return {"tool": tool_name, "args": args}

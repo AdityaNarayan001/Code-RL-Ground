@@ -1,5 +1,5 @@
-import { Play, Square, Wifi, WifiOff, Clock, Zap, CheckCircle } from 'lucide-react'
-import { TrainingStatus, PRInfo, TrainingMetrics, WSMessage } from '../types'
+import { Play, Square, Wifi, WifiOff, Clock, Zap, CheckCircle, AlertTriangle } from 'lucide-react'
+import { TrainingStatus, PRInfo, TrainingMetrics, WSMessage, AdvancedMetrics } from '../types'
 import MetricsPanel from './MetricsPanel'
 import RewardChart from './RewardChart'
 import LossChart from './LossChart'
@@ -16,6 +16,8 @@ interface DashboardProps {
   connected: boolean
   onStartTraining: () => void
   onStopTraining: () => void
+  advancedMetrics?: AdvancedMetrics | null
+  errorMessage?: string | null
 }
 
 function Dashboard({
@@ -27,6 +29,8 @@ function Dashboard({
   connected,
   onStartTraining,
   onStopTraining,
+  advancedMetrics,
+  errorMessage,
 }: DashboardProps) {
   const formatTime = (seconds: number) => {
     const h = Math.floor(seconds / 3600)
@@ -38,8 +42,18 @@ function Dashboard({
   const solvedCount = prs.filter(p => p.status === 'solved').length
   const totalCount = prs.length
 
+  const am = advancedMetrics
+
   return (
     <div className="flex flex-col h-screen">
+      {/* Error banner */}
+      {errorMessage && (
+        <div className="bg-red-900/80 border-b border-red-700 px-6 py-2 flex items-center gap-2 text-red-200 text-sm">
+          <AlertTriangle size={16} />
+          <span>{errorMessage}</span>
+        </div>
+      )}
+
       {/* Header */}
       <header className="bg-gray-800 border-b border-gray-700 px-6 py-4">
         <div className="flex items-center justify-between">
@@ -59,7 +73,7 @@ function Dashboard({
               </span>
             )}
           </div>
-          
+
           <div className="flex items-center gap-4">
             {status && (
               <>
@@ -77,7 +91,7 @@ function Dashboard({
                 </div>
               </>
             )}
-            
+
             {status?.is_running ? (
               <button
                 onClick={onStopTraining}
@@ -98,6 +112,53 @@ function Dashboard({
           </div>
         </div>
       </header>
+
+      {/* Advanced metrics bar */}
+      {am && (
+        <div className="bg-gray-800/50 border-b border-gray-700 px-6 py-2 flex items-center gap-6 text-xs text-gray-400 overflow-x-auto">
+          {am.memory_usage && am.memory_usage.total_mb > 0 && (
+            <div className="flex items-center gap-2 shrink-0">
+              <span>Memory:</span>
+              <div className="w-24 h-2 bg-gray-700 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-blue-500 rounded-full transition-all"
+                  style={{ width: `${Math.min(100, (am.memory_usage.used_mb / am.memory_usage.total_mb) * 100)}%` }}
+                />
+              </div>
+              <span className="text-gray-300">
+                {(am.memory_usage.used_mb / 1024).toFixed(1)}/{(am.memory_usage.total_mb / 1024).toFixed(1)} GB
+              </span>
+            </div>
+          )}
+          {am.curriculum_progress && am.curriculum_progress.total > 0 && (
+            <div className="shrink-0">
+              <span>Curriculum: </span>
+              <span className="text-gray-300">
+                PR {am.curriculum_progress.current}/{am.curriculum_progress.total}
+                {am.curriculum_progress.current_pr_id && ` - ${am.curriculum_progress.current_pr_id}`}
+              </span>
+            </div>
+          )}
+          {am.reward_std !== null && (
+            <div className="shrink-0">
+              <span>Reward Std: </span>
+              <span className="text-gray-300">{am.reward_std.toFixed(4)}</span>
+            </div>
+          )}
+          {am.step_timing && am.step_timing.avg_ms > 0 && (
+            <div className="shrink-0">
+              <span>Avg Step: </span>
+              <span className="text-gray-300">{(am.step_timing.avg_ms / 1000).toFixed(1)}s</span>
+            </div>
+          )}
+          {am.policy_entropy !== null && (
+            <div className="shrink-0">
+              <span>Policy Entropy: </span>
+              <span className="text-gray-300">{am.policy_entropy.toFixed(4)}</span>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Main content */}
       <div className="flex-1 flex overflow-hidden">
@@ -123,11 +184,13 @@ function Dashboard({
               </div>
             </div>
             <div className="w-72 shrink-0">
-              <MetricsPanel 
+              <MetricsPanel
                 avgReward={status?.avg_reward || 0}
                 solvedPRs={solvedCount}
                 totalPRs={totalCount}
                 step={status?.current_step || 0}
+                advancedMetrics={advancedMetrics}
+                latestSteps={metrics.steps.slice(-10)}
               />
             </div>
           </div>

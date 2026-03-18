@@ -13,7 +13,7 @@ function RewardChart({ data, currentStep: _currentStep }: RewardChartProps) {
     const start = Math.max(0, i - windowSize + 1)
     const window = data.slice(start, i + 1)
     const avg = window.reduce((sum, p) => sum + p.reward, 0) / window.length
-    
+
     return {
       episode: point.episode,
       reward: point.reward,
@@ -30,6 +30,16 @@ function RewardChart({ data, currentStep: _currentStep }: RewardChartProps) {
     )
   }
 
+  // Compute Y domain from data with padding
+  const allValues = chartData.flatMap(d => [d.reward, d.avgReward])
+  const minVal = Math.min(...allValues)
+  const maxVal = Math.max(...allValues)
+  const padding = Math.max((maxVal - minVal) * 0.1, 0.05)
+  const yDomain: [number, number] = [
+    Math.max(0, Math.floor((minVal - padding) * 20) / 20),
+    Math.ceil((maxVal + padding) * 20) / 20,
+  ]
+
   // Find current episode (latest)
   const currentEpisode = chartData.length > 0 ? chartData[chartData.length - 1].episode : 0
 
@@ -43,19 +53,19 @@ function RewardChart({ data, currentStep: _currentStep }: RewardChartProps) {
           </linearGradient>
         </defs>
         <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-        <XAxis 
-          dataKey="episode" 
-          stroke="#9ca3af" 
+        <XAxis
+          dataKey="episode"
+          stroke="#9ca3af"
           tick={{ fill: '#9ca3af', fontSize: 10 }}
         />
-        <YAxis 
-          domain={[0, 1]}
-          stroke="#9ca3af" 
+        <YAxis
+          domain={yDomain}
+          stroke="#9ca3af"
           tick={{ fill: '#9ca3af', fontSize: 10 }}
         />
-        <Tooltip 
-          contentStyle={{ 
-            backgroundColor: '#1f2937', 
+        <Tooltip
+          contentStyle={{
+            backgroundColor: '#1f2937',
             border: '1px solid #374151',
             borderRadius: '0.5rem',
           }}
@@ -64,9 +74,9 @@ function RewardChart({ data, currentStep: _currentStep }: RewardChartProps) {
         />
         {/* Current episode indicator */}
         {currentEpisode > 0 && (
-          <ReferenceLine 
-            x={currentEpisode} 
-            stroke="#f59e0b" 
+          <ReferenceLine
+            x={currentEpisode}
+            stroke="#f59e0b"
             strokeWidth={2}
             strokeDasharray="4 4"
           />

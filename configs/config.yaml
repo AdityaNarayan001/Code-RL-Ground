@@ -33,7 +33,7 @@ training:
   
   # GRPO specific (Group Relative Policy Optimization)
   grpo:
-    group_size: 4  # Number of completions per prompt
+    group_size: 2  # Number of completions per prompt
     beta: 0.1  # KL penalty coefficient
     clip_range: 0.2
     
@@ -91,10 +91,10 @@ environment:
 rewards:
   weights:
     syntax_valid: 0.1
-    compiles: 0.2
-    tests_pass: 0.3
-    files_match: 0.2
+    tests_pass: 0.5
+    files_match: 0.1
     exact_match: 0.2
+    import_check: 0.1
   
   # Partial credit settings
   partial_credit:
@@ -111,8 +111,10 @@ curriculum:
   # Strict progression: Must solve current PR before moving to next
   strict_progression: true
   solve_threshold: 0.9  # Reward threshold to consider PR "solved"
-  min_consecutive_solves: 3  # Must solve N times consecutively to confirm mastery
-  max_attempts_per_pr: 1000  # Max attempts before forcing move (safety valve)
+  min_consecutive_solves: 3  # Legacy consecutive-solve check (fallback)
+  max_attempts_per_pr: 200  # Max attempts before forcing move (safety valve)
+  mastery_window: 5  # Look at last K attempts for mastery check
+  mastery_required: 3  # Require M successes within the window
 
 # Data Augmentation
 augmentation:

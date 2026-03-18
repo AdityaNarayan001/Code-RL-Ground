@@ -17,9 +17,19 @@ const toolIcons: Record<string, React.ReactNode> = {
   list_directory: <FileCode size={14} className="text-gray-400" />,
 }
 
+function formatTimestamp(ts?: string): string {
+  if (!ts) return ''
+  try {
+    const d = new Date(ts)
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+  } catch {
+    return ''
+  }
+}
+
 function ToolCallLog({ logs }: ToolCallLogProps) {
   const containerRef = useRef<HTMLDivElement>(null)
-  
+
   useEffect(() => {
     if (containerRef.current) {
       containerRef.current.scrollTop = containerRef.current.scrollHeight
@@ -27,7 +37,7 @@ function ToolCallLog({ logs }: ToolCallLogProps) {
   }, [logs])
 
   // Filter for tool-related and important events
-  const relevantLogs = logs.filter(l => 
+  const relevantLogs = logs.filter(l =>
     ['tool_call', 'tool_result', 'episode', 'pr_solved', 'error', 'checkpoint', 'info', 'training_error', 'training_complete'].includes(l.type)
   ).slice(-100)
 
@@ -37,8 +47,8 @@ function ToolCallLog({ logs }: ToolCallLogProps) {
         <h2 className="text-lg font-semibold text-white">Activity Log</h2>
         <p className="text-sm text-gray-400">Tool calls & events</p>
       </div>
-      
-      <div 
+
+      <div
         ref={containerRef}
         className="flex-1 overflow-auto p-2 text-xs"
       >
@@ -59,6 +69,8 @@ function ToolCallLog({ logs }: ToolCallLogProps) {
 }
 
 function LogEntry({ log }: { log: WSMessage }) {
+  const ts = formatTimestamp(log.timestamp)
+
   const getIcon = () => {
     switch (log.type) {
       case 'tool_call':
@@ -118,7 +130,7 @@ function LogEntry({ log }: { log: WSMessage }) {
       case 'episode':
         return (
           <span>
-            Episode {log.episode}: {log.pr_id} - 
+            Episode {log.episode}: {log.pr_id} -
             <span className={log.solved ? 'text-green-400' : 'text-yellow-400'}>
               {' '}{log.solved ? 'Solved!' : `R=${log.reward?.toFixed(2)}`}
             </span>
@@ -127,7 +139,7 @@ function LogEntry({ log }: { log: WSMessage }) {
       case 'pr_solved':
         return (
           <span className="text-green-400 font-medium">
-            🎉 {log.pr_id} SOLVED!
+            {log.pr_id} SOLVED!
           </span>
         )
       case 'checkpoint':
@@ -152,7 +164,7 @@ function LogEntry({ log }: { log: WSMessage }) {
       case 'training_complete':
         return (
           <span className="text-green-400 font-medium">
-            🎉 Training complete!
+            Training complete!
           </span>
         )
       default:
@@ -162,7 +174,7 @@ function LogEntry({ log }: { log: WSMessage }) {
 
   return (
     <div className={clsx(
-      'flex items-center gap-2 p-2 rounded',
+      'flex items-start gap-2 p-2 rounded',
       log.type === 'pr_solved' && 'bg-green-900/30',
       log.type === 'training_complete' && 'bg-green-900/30',
       (log.type === 'error' || log.type === 'training_error') && 'bg-red-900/30',
@@ -170,8 +182,13 @@ function LogEntry({ log }: { log: WSMessage }) {
       log.type === 'info' && 'bg-blue-900/10'
     )}>
       {getIcon()}
-      <div className="flex-1 truncate text-gray-300">
-        {getMessage()}
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2">
+          <span className="truncate text-gray-300">{getMessage()}</span>
+        </div>
+        {ts && (
+          <span className="text-gray-600 text-[10px]">{ts}</span>
+        )}
       </div>
     </div>
   )

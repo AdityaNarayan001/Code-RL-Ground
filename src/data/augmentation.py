@@ -29,6 +29,26 @@ DOCSTRING_PREFIXES = [
     "A utility to {}.",
 ]
 
+# Rephrase mappings for docstring first-line variation
+DOCSTRING_REPHRASE = {
+    'Computes': 'Calculates',
+    'Calculates': 'Computes',
+    'Returns': 'Gets',
+    'Gets': 'Returns',
+    'Checks': 'Verifies',
+    'Verifies': 'Checks',
+    'Creates': 'Constructs',
+    'Constructs': 'Creates',
+    'Finds': 'Locates',
+    'Locates': 'Finds',
+    'Converts': 'Transforms',
+    'Transforms': 'Converts',
+    'Removes': 'Deletes',
+    'Deletes': 'Removes',
+    'Parses': 'Reads',
+    'Reads': 'Parses',
+}
+
 
 @dataclass
 class AugmentedTask:
@@ -145,74 +165,202 @@ class DataAugmenter:
     def _rename_variables(self, code: str, variant_idx: int) -> str:
         """Rename variables in a code string."""
         result = code
-        
+
         for old_var, new_vars in VARIABLE_MAPPINGS.items():
             if len(new_vars) > variant_idx:
                 new_var = new_vars[variant_idx % len(new_vars)]
-                # Only rename if it's a standalone variable (word boundary)
-                pattern = r'\b' + re.escape(old_var) + r'\b'
-                # Skip if it's part of a longer word
-                if len(old_var) == 1:
-                    # For single char vars, be more careful
-                    # Only replace in function args and assignments
-                    pattern = rf'(?<=[\(\s,=:]){re.escape(old_var)}(?=[\s,\):\[])'
-                    result = re.sub(pattern, new_var, result)
-        
+                # Use word boundaries but skip attribute access (self.var, obj.var)
+                # and string literals are handled by only replacing outside quotes
+                pattern = rf'(?<!\.)(?<!\w){re.escape(old_var)}(?!\w)'
+                result = re.sub(pattern, new_var, result)
+
         return result
     
     def _apply_docstring_variation(self, task: PRTask, variant_idx: int) -> PRTask:
-        """Apply docstring variation augmentation."""
+        """Apply docstring variation augmentation.
+
+        Variant 0: Swap triple-quote style (double <-> single).
+        Variant 1: Add an 'Args:' section if function has parameters.
+        Variant 2: Rephrase the first line using synonym mappings.
+        """
         expected_changes = task.data.get('expected_changes', {})
-        
+        variation = variant_idx % 3
+
         for filepath, changes in expected_changes.items():
             if 'additions' in changes:
                 new_additions = []
                 in_docstring = False
-                
+                docstring_first_line = True
+
                 for line in changes['additions']:
                     stripped = line.strip()
-                    
+
                     if stripped.startswith('"""') or stripped.startswith("'''"):
                         if in_docstring:
+                            # Closing docstring
                             in_docstring = False
+                            docstring_first_line = False
+                            if variation == 0:
+                                if '"""' in line:
+                                    line = line.replace('"""', "'''")
+                                else:
+                                    line = line.replace("'''", '"""')
                         else:
+                            # Opening docstring
                             in_docstring = True
-                            # Vary the docstring content slightly
-                            if variant_idx == 0:
-                                line = line.replace('"""', "'''")
-                    
+                            docstring_first_line = True
+
+                            if variation == 0:
+                                # Swap quote style
+                                if '"""' in line:
+                                    line = line.replace('"""', "'''")
+                                else:
+                                    line = line.replace("'''", '"""')
+                            elif variation == 1:
+                                # Will add Args section after closing quote
+                                pass
+                            elif variation == 2:
+                                # Rephrase first line
+                                for old_word, new_word in DOCSTRING_REPHRASE.items():
+                                    if old_word in line:
+                                        line = line.replace(old_word, new_word, 1)
+                                        break
+                    elif in_docstring and docstring_first_line and variation == 2:
+                        # Rephrase content lines within the first line of docstring
+                        for old_word, new_word in DOCSTRING_REPHRASE.items():
+                            if old_word in line:
+                                line = line.replace(old_word, new_word, 1)
+                                break
+                        docstring_first_line = False
+
                     new_additions.append(line)
-                
+
+                # Variant 1: add Args section if function def is present
+                if variation == 1:
+                    new_additions = self._add_args_section(new_additions)
+
                 changes['additions'] = new_additions
-        
+
         task.data['expected_changes'] = expected_changes
         return task
+
+    def _add_args_section(self, lines: List[str]) -> List[str]:
+        """Add an Args: section to docstrings of functions that have parameters."""
+        result = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+
+            # Detect function definitions
+            if stripped.startswith('def ') and '(' in stripped:
+                result.append(line)
+                # Extract parameter names (skip self)
+                match = re.search(r'\(([^)]*)\)', stripped)
+                params = []
+                if match:
+                    raw_params = match.group(1).split(',')
+                    for p in raw_params:
+                        p = p.strip().split(':')[0].split('=')[0].strip()
+                        if p and p != 'self':
+                            params.append(p)
+
+                # Look for existing docstring on next lines
+                if i + 1 < len(lines):
+                    next_stripped = lines[i + 1].strip()
+                    if next_stripped.startswith('"""') or next_stripped.startswith("'''"):
+                        # Find the indent of the docstring
+                        indent = lines[i + 1][:len(lines[i + 1]) - len(lines[i + 1].lstrip())]
+                        # Add the docstring opening line
+                        result.append(lines[i + 1])
+                        i += 2
+                        # Find docstring closing and check if Args already present
+                        has_args = False
+                        docstring_lines = []
+                        while i < len(lines):
+                            ds = lines[i].strip()
+                            if 'Args:' in ds:
+                                has_args = True
+                            docstring_lines.append(lines[i])
+                            if (ds.endswith('"""') or ds.endswith("'''")) and len(docstring_lines) > 0:
+                                break
+                            i += 1
+
+                        # Insert Args section before closing if params exist and no Args yet
+                        if params and not has_args and docstring_lines:
+                            closing = docstring_lines.pop()
+                            for dl in docstring_lines:
+                                result.append(dl)
+                            result.append(f"{indent}")
+                            result.append(f"{indent}Args:")
+                            for p in params:
+                                result.append(f"{indent}    {p}: Parameter value.")
+                            result.append(closing)
+                        else:
+                            result.extend(docstring_lines)
+                        i += 1
+                        continue
+                i += 1
+            else:
+                result.append(line)
+                i += 1
+        return result
     
     def _apply_whitespace_variation(self, task: PRTask, variant_idx: int) -> PRTask:
-        """Apply whitespace variation augmentation."""
-        # Add or remove blank lines between functions
+        """Apply whitespace variation augmentation.
+
+        Variant 0: Extra blank line between functions (3 blank lines).
+        Variant 1: Compact style (single blank line between functions).
+        Variant 2: PEP 8 style (two blank lines between top-level functions).
+        """
         expected_changes = task.data.get('expected_changes', {})
-        
+        variation = variant_idx % 3
+
         for filepath, changes in expected_changes.items():
             if 'additions' in changes:
                 new_additions = []
-                prev_empty = False
-                
-                for line in changes['additions']:
+                i = 0
+                lines = changes['additions']
+
+                while i < len(lines):
+                    line = lines[i]
+
+                    # Detect blank line regions preceding a top-level def/class
                     if line.strip() == '':
-                        # Vary number of blank lines
-                        if variant_idx % 2 == 0 and not prev_empty:
-                            new_additions.append('')
-                            new_additions.append('')
+                        # Collect consecutive blank lines
+                        blank_count = 0
+                        while i < len(lines) and lines[i].strip() == '':
+                            blank_count += 1
+                            i += 1
+
+                        # Check if next non-blank line is a top-level function/class
+                        is_top_level_def = (
+                            i < len(lines) and
+                            (lines[i].startswith('def ') or lines[i].startswith('class '))
+                        )
+
+                        if is_top_level_def:
+                            if variation == 0:
+                                # Extra blank lines
+                                new_additions.extend([''] * 3)
+                            elif variation == 1:
+                                # Compact: single blank line
+                                new_additions.append('')
+                            else:
+                                # PEP 8: two blank lines
+                                new_additions.extend([''] * 2)
                         else:
-                            new_additions.append('')
-                        prev_empty = True
+                            # Non-function blank lines: keep at most 1
+                            if variation == 1:
+                                new_additions.append('')
+                            else:
+                                new_additions.extend([''] * min(blank_count, 2))
                     else:
                         new_additions.append(line)
-                        prev_empty = False
-                
+                        i += 1
+
                 changes['additions'] = new_additions
-        
+
         task.data['expected_changes'] = expected_changes
         return task
     

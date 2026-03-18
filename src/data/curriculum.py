@@ -18,29 +18,56 @@ class PRProgress:
     consecutive_solves: int = 0
     solved: bool = False
     recent_rewards: deque = None
-    
+    recent_solves: deque = None
+
     def __post_init__(self):
         if self.recent_rewards is None:
             self.recent_rewards = deque(maxlen=20)
-    
+        if self.recent_solves is None:
+            self.recent_solves = deque(maxlen=20)
+
     def update(self, reward: float, solved: bool):
         """Update progress with new attempt."""
         self.attempts += 1
         self.recent_rewards.append(reward)
-        
+        self.recent_solves.append(solved)
+
         if reward > self.best_reward:
             self.best_reward = reward
-        
+
         if solved:
             self.consecutive_solves += 1
         else:
             self.consecutive_solves = 0
-    
+
+    def check_mastery(self, window: int = 5, required: int = 3) -> bool:
+        """Check mastery using best M out of last K attempts.
+
+        Args:
+            window: Number of recent attempts to consider (K).
+            required: Number of successes required within window (M).
+
+        Returns:
+            True if at least ``required`` of the last ``window`` attempts were solves.
+        """
+        recent = list(self.recent_solves)[-window:]
+        return sum(recent) >= required
+
     @property
     def avg_reward(self) -> float:
         if not self.recent_rewards:
             return 0.0
         return sum(self.recent_rewards) / len(self.recent_rewards)
+
+    @property
+    def success_rate(self) -> float:
+        """Overall success rate across all attempts."""
+        if not self.recent_solves:
+            return 0.0
+        total = len(self.recent_solves)
+        if total == 0:
+            return 0.0
+        return sum(self.recent_solves) / total
 
 
 class CurriculumManager:
@@ -155,24 +182,40 @@ class CurriculumManager:
     
     def update_progress(self, pr_id: str, reward: float) -> bool:
         """Update progress for a PR.
-        
+
+        Uses a "best M out of last K" mastery check: the PR is considered
+        solved when at least ``mastery_required`` of the last
+        ``mastery_window`` attempts meet the solve threshold.  Falls back
+        to the legacy ``min_consecutive_solves`` check when the windowed
+        fields are not configured (both zero).
+
         Args:
             pr_id: PR ID
             reward: Reward from attempt
-            
+
         Returns:
             True if PR is now solved
         """
         progress = self.progress[pr_id]
         solved = reward >= self.curriculum_config.solve_threshold
         progress.update(reward, solved)
-        
-        # Check if PR should be marked as solved
-        if (progress.consecutive_solves >= self.curriculum_config.min_consecutive_solves and
-            progress.best_reward >= self.curriculum_config.solve_threshold):
-            progress.solved = True
-            return True
-        
+
+        window = getattr(self.curriculum_config, 'mastery_window', 0)
+        required = getattr(self.curriculum_config, 'mastery_required', 0)
+
+        if window > 0 and required > 0:
+            # Windowed mastery: best M out of last K
+            if (progress.check_mastery(window=window, required=required) and
+                    progress.best_reward >= self.curriculum_config.solve_threshold):
+                progress.solved = True
+                return True
+        else:
+            # Legacy: N consecutive solves
+            if (progress.consecutive_solves >= self.curriculum_config.min_consecutive_solves and
+                    progress.best_reward >= self.curriculum_config.solve_threshold):
+                progress.solved = True
+                return True
+
         return False
     
     def is_pr_solved(self, pr_id: str) -> bool:
@@ -250,6 +293,41 @@ class CurriculumManager:
             }
         }
     
+    def get_progress_summary(self) -> Dict[str, Any]:
+        """Return a summary of curriculum progress for monitoring.
+
+        Returns:
+            Dictionary with current PR, solved PRs, per-PR attempts and
+            success rates, and overall completion percentage.
+        """
+        current_task = self.get_current_task()
+        current_pr = current_task.pr_id if current_task else None
+
+        per_pr = {}
+        for pr_id, prog in self.progress.items():
+            per_pr[pr_id] = {
+                'attempts': prog.attempts,
+                'best_reward': prog.best_reward,
+                'avg_reward': prog.avg_reward,
+                'success_rate': prog.success_rate,
+                'solved': prog.solved,
+                'consecutive_solves': prog.consecutive_solves,
+            }
+
+        solved_prs = self.get_solved_prs()
+        total = len(self.all_tasks)
+
+        return {
+            'current_pr': current_pr,
+            'current_pr_idx': self._current_idx,
+            'total_prs': total,
+            'solved_prs': solved_prs,
+            'num_solved': len(solved_prs),
+            'completion_pct': (len(solved_prs) / total * 100) if total > 0 else 0.0,
+            'is_complete': self.is_complete(),
+            'per_pr': per_pr,
+        }
+
     def reset(self):
         """Reset curriculum to beginning."""
         self._current_idx = 0
@@ -259,3 +337,4 @@ class CurriculumManager:
             progress.consecutive_solves = 0
             progress.solved = False
             progress.recent_rewards.clear()
+            progress.recent_solves.clear()

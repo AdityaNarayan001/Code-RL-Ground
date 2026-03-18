@@ -12,6 +12,7 @@ class DiffResult:
     similarity: float  # 0.0 to 1.0
     matching_lines: int
     total_lines: int
+    matching_lines_ratio: float  # matching_lines / total_lines
     additions_matched: float  # How many expected additions are present
     diff_text: str  # Human-readable diff
 
@@ -84,10 +85,14 @@ class DiffScorer:
         # Calculate additions matched
         additions_matched = self._score_additions(actual, expected)
         
+        total = len(expected_lines)
+        matching_lines_ratio = matching / total if total > 0 else 0.0
+
         return DiffResult(
             similarity=similarity,
             matching_lines=matching,
-            total_lines=len(expected_lines),
+            total_lines=total,
+            matching_lines_ratio=matching_lines_ratio,
             additions_matched=additions_matched,
             diff_text=diff_text
         )
@@ -132,12 +137,12 @@ class DiffScorer:
         """Extract key patterns from code for matching."""
         patterns = []
         
-        # Return statements
-        returns = re.findall(r'return\s+[^#\n]+', code)
+        # Return statements - match 'return' only as a keyword (not inside identifiers)
+        returns = re.findall(r'(?<!\w)return\s+[^#\n]+', code)
         patterns.extend(returns[:5])  # Limit
-        
-        # Raise statements
-        raises = re.findall(r'raise\s+\w+', code)
+
+        # Raise statements - match 'raise' as keyword, capture exception class and args
+        raises = re.findall(r'(?<!\w)raise\s+\w+(?:\([^)]*\))?', code)
         patterns.extend(raises[:3])
         
         # Key operations

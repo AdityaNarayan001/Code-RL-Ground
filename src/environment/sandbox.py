@@ -1,5 +1,6 @@
 """Python sandbox for safe code execution."""
 
+import platform
 import subprocess
 import sys
 import tempfile
@@ -8,7 +9,18 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 import signal
-import resource
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Only import resource on non-Windows platforms
+_HAS_RESOURCE = False
+if platform.system() != "Windows":
+    try:
+        import resource
+        _HAS_RESOURCE = True
+    except ImportError:
+        pass
 
 
 @dataclass
@@ -56,7 +68,44 @@ class PythonSandbox:
             "dataclasses", "abc", "copy", "io", "string"
         ]
         self.working_dir = working_dir
-    
+
+        # Allowlist of environment variables to pass to subprocesses
+        self._env_allowlist = ["PATH", "HOME", "LANG", "PYTHONPATH", "PYTHONDONTWRITEBYTECODE"]
+
+    def _get_sanitized_env(self, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+        """Build a sanitized environment dict using only allowlisted variables."""
+        env = {}
+        for key in self._env_allowlist:
+            if key in os.environ:
+                env[key] = os.environ[key]
+        if extra:
+            env.update(extra)
+        return env
+
+    def _set_resource_limits(self):
+        """Set resource limits for child process (memory). Used as preexec_fn."""
+        if _HAS_RESOURCE:
+            try:
+                max_bytes = self.max_memory_mb * 1024 * 1024
+                resource.setrlimit(resource.RLIMIT_AS, (max_bytes, max_bytes))
+            except (ValueError, OSError) as e:
+                # Some platforms may not support RLIMIT_AS; log and continue
+                logger.debug(f"Could not set memory limit: {e}")
+
+    @staticmethod
+    def _kill_process(process: subprocess.Popen):
+        """Kill a child process and its process group if possible."""
+        try:
+            process.kill()
+        except OSError:
+            pass
+        # Try to kill the entire process group
+        if hasattr(os, 'killpg'):
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+
     def _create_wrapper_script(self, code: str, test_code: Optional[str] = None) -> str:
         """Create a wrapper script for execution.
         
@@ -136,39 +185,51 @@ except Exception as e:
             script_path.write_text(script_content)
             
             try:
-                # Run the script
-                result = subprocess.run(
+                # Build sanitized environment
+                sandbox_env = self._get_sanitized_env({
+                    'PYTHONPATH': str(work_dir),
+                    'PYTHONDONTWRITEBYTECODE': '1'
+                })
+
+                # Set preexec_fn for resource limits (non-Windows only)
+                preexec = self._set_resource_limits if _HAS_RESOURCE else None
+
+                # Use Popen for better control over child process cleanup
+                process = subprocess.Popen(
                     [sys.executable, str(script_path)],
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
-                    timeout=self.timeout,
                     cwd=str(work_dir),
-                    env={
-                        **os.environ,
-                        'PYTHONPATH': str(work_dir),
-                        'PYTHONDONTWRITEBYTECODE': '1'
-                    }
+                    env=sandbox_env,
+                    preexec_fn=preexec,
+                    start_new_session=True
                 )
-                
+
+                try:
+                    stdout, stderr = process.communicate(timeout=self.timeout)
+                except subprocess.TimeoutExpired:
+                    # Kill the child process and its process group
+                    self._kill_process(process)
+                    stdout, stderr = process.communicate(timeout=5)
+                    return ExecutionResult(
+                        success=False,
+                        stdout=stdout or "",
+                        stderr=f"Execution timed out after {self.timeout} seconds",
+                        return_code=-1,
+                        timed_out=True,
+                        error_message="Timeout",
+                        execution_time=self.timeout
+                    )
+
                 execution_time = time.time() - start_time
-                
+
                 return ExecutionResult(
-                    success=result.returncode == 0,
-                    stdout=result.stdout,
-                    stderr=result.stderr,
-                    return_code=result.returncode,
+                    success=process.returncode == 0,
+                    stdout=stdout,
+                    stderr=stderr,
+                    return_code=process.returncode,
                     execution_time=execution_time
-                )
-                
-            except subprocess.TimeoutExpired:
-                return ExecutionResult(
-                    success=False,
-                    stdout="",
-                    stderr=f"Execution timed out after {self.timeout} seconds",
-                    return_code=-1,
-                    timed_out=True,
-                    error_message="Timeout",
-                    execution_time=self.timeout
                 )
             except Exception as e:
                 return ExecutionResult(

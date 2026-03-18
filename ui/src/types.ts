@@ -29,6 +29,9 @@ export interface StepMetric {
   grad_norm?: number
   clip_frac?: number
   max_reward?: number
+  entropy?: number
+  gradient_variance?: number
+  step_duration_ms?: number
 }
 
 export interface EpisodeMetric {
@@ -36,6 +39,8 @@ export interface EpisodeMetric {
   reward: number
   pr_id: string
   solved: boolean
+  duration_ms?: number
+  turn_count?: number
 }
 
 export interface TrainingMetrics {
@@ -43,12 +48,26 @@ export interface TrainingMetrics {
   episodes: EpisodeMetric[]
 }
 
+export interface AdvancedMetrics {
+  policy_entropy: number | null
+  reward_std: number | null
+  reward_distribution: number[]
+  curriculum_progress: { current: number; total: number; current_pr_id: string | null }
+  memory_usage: { used_mb: number; total_mb: number }
+  step_timing: { avg_ms: number; last_ms: number }
+  gradient_stats: { variance: number | null; norm: number | null }
+  episode_length_avg: number | null
+}
+
 export interface WSMessage {
   type: string
+  timestamp?: string
   pr_id?: string
   episode?: number
   turn?: number
   group_idx?: number
+  group_size?: number
+  max_turns?: number
   turns?: number
   reward?: number
   solved?: boolean

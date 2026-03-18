@@ -115,10 +115,10 @@ class EnvironmentConfig:
 @dataclass
 class RewardWeights:
     syntax_valid: float = 0.1
-    compiles: float = 0.2
-    tests_pass: float = 0.3
-    files_match: float = 0.2
+    tests_pass: float = 0.5
+    files_match: float = 0.1
     exact_match: float = 0.2
+    import_check: float = 0.1
 
 
 @dataclass
@@ -142,7 +142,9 @@ class CurriculumConfig:
     strict_progression: bool = True
     solve_threshold: float = 0.9
     min_consecutive_solves: int = 3
-    max_attempts_per_pr: int = 1000
+    max_attempts_per_pr: int = 200
+    mastery_window: int = 5
+    mastery_required: int = 3
 
 
 @dataclass
@@ -275,11 +277,14 @@ def _dict_to_dataclass(cls, data: Dict[str, Any]):
     """Recursively convert a dictionary to a dataclass instance."""
     if data is None:
         return cls()
-    
+
     field_types = {f.name: f.type for f in cls.__dataclass_fields__.values()}
     kwargs = {}
-    
+
     for key, value in data.items():
+        # Backward compat: silently ignore 'compiles' in reward weights
+        if key == 'compiles' and cls is RewardWeights:
+            continue
         if key in field_types:
             field_type = field_types[key]
             # Check if it's a dataclass
@@ -287,7 +292,7 @@ def _dict_to_dataclass(cls, data: Dict[str, Any]):
                 kwargs[key] = _dict_to_dataclass(field_type, value)
             else:
                 kwargs[key] = value
-    
+
     return cls(**kwargs)
 
 

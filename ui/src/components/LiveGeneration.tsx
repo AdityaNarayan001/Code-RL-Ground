@@ -10,7 +10,7 @@ function LiveGeneration({ text, logs }: LiveGenerationProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const [lastComplete, setLastComplete] = useState<WSMessage | null>(null)
   const [lastToken, setLastToken] = useState<WSMessage | null>(null)
-  
+
   // Auto-scroll to bottom
   useEffect(() => {
     if (containerRef.current) {
@@ -20,15 +20,12 @@ function LiveGeneration({ text, logs }: LiveGenerationProps) {
 
   // Track latest generation events separately - scan backwards for efficiency
   useEffect(() => {
-    // Find latest generation_complete
     for (let i = logs.length - 1; i >= 0; i--) {
       if (logs[i].type === 'generation_complete') {
         setLastComplete(logs[i])
         break
       }
     }
-    
-    // Find latest generation_token
     for (let i = logs.length - 1; i >= 0; i--) {
       if (logs[i].type === 'generation_token') {
         setLastToken(logs[i])
@@ -37,24 +34,33 @@ function LiveGeneration({ text, logs }: LiveGenerationProps) {
     }
   }, [logs])
 
-  // Extract recent generation events for history
+  // Collect previous turns within the current episode for display
+  const currentEpisodeId = lastToken?.episode ?? lastComplete?.episode
+  const currentPRId = lastToken?.pr_id ?? lastComplete?.pr_id
+  const previousTurnsInEpisode = logs
+    .filter(l =>
+      l.type === 'generation_complete' &&
+      l.episode === currentEpisodeId &&
+      l.pr_id === currentPRId
+    )
+
+  // Extract recent generation events for history (different episodes)
   const generationLogs = logs
     .filter(l => l.type === 'generation_complete')
-    .slice(-5)
+    .slice(-10)
 
   // Determine what to show
   const isStreaming = !!text
   const displayText = text || lastToken?.full_text || lastComplete?.full_text || ''
   const currentPR = (isStreaming ? lastToken?.pr_id : lastComplete?.pr_id) || lastToken?.pr_id || lastComplete?.pr_id || ''
-  
-  // During streaming, show turn and group from the latest token
-  // After complete, show episode info from the latest complete
-  const currentTurn = lastToken?.turn || 0
-  const currentEpisode = lastComplete?.episode || 0
-  const currentGroup = isStreaming 
-    ? (lastToken?.group_idx || lastComplete?.group_idx || 0)
-    : (lastComplete?.group_idx || 0)
-  const numTurns = lastComplete?.turns || 0
+
+  // Use clear labels: Group X/groupSize and Turn Y/maxTurns
+  const currentTurn = lastToken?.turn ?? lastComplete?.turn ?? 0
+  const maxTurns = lastToken?.max_turns ?? lastComplete?.max_turns ?? lastComplete?.turns ?? 0
+  const currentGroup = isStreaming
+    ? (lastToken?.group_idx ?? lastComplete?.group_idx ?? 0)
+    : (lastComplete?.group_idx ?? 0)
+  const groupSize = lastToken?.group_size ?? lastComplete?.group_size ?? 0
   const episodeReward = lastComplete?.reward
   const episodeSolved = lastComplete?.solved
 
@@ -62,7 +68,7 @@ function LiveGeneration({ text, logs }: LiveGenerationProps) {
     <div className="h-full flex flex-col">
       <div className="p-4 border-b border-gray-700">
         <h2 className="text-lg font-semibold text-white">Model Generation</h2>
-        <div className="flex items-center gap-3 mt-1">
+        <div className="flex items-center gap-3 mt-1 flex-wrap">
           {currentPR && (
             <span className="px-2 py-0.5 bg-blue-600 rounded text-xs font-medium">
               {currentPR}
@@ -70,18 +76,19 @@ function LiveGeneration({ text, logs }: LiveGenerationProps) {
           )}
           {isStreaming && currentTurn > 0 && (
             <span className="text-sm text-yellow-400">
-              Turn {currentTurn}/10 • Episode {currentGroup}/4
+              Turn {currentTurn}{maxTurns > 0 ? `/${maxTurns}` : ''}
+              {currentGroup > 0 && (<> {' | '} Group {currentGroup}{groupSize > 0 ? `/${groupSize}` : ''}</>)}
             </span>
           )}
-          {!isStreaming && currentEpisode > 0 && (
+          {!isStreaming && lastComplete && (
             <span className="text-sm text-gray-400">
-              Episode {currentEpisode} (Group {currentGroup}/4)
-              {numTurns > 0 && ` • ${numTurns} turns`}
+              {currentGroup > 0 && `Group ${currentGroup}${groupSize > 0 ? `/${groupSize}` : ''}`}
+              {maxTurns > 0 && ` | ${maxTurns} turns`}
             </span>
           )}
           {episodeReward !== undefined && (
             <span className={`text-sm ${episodeSolved ? 'text-green-400' : 'text-yellow-400'}`}>
-              R={episodeReward.toFixed(2)}{episodeSolved ? ' ✓' : ''}
+              R={episodeReward.toFixed(2)}{episodeSolved ? ' (solved)' : ''}
             </span>
           )}
           <span className="text-sm text-gray-400">
@@ -89,11 +96,36 @@ function LiveGeneration({ text, logs }: LiveGenerationProps) {
           </span>
         </div>
       </div>
-      
-      <div 
+
+      <div
         ref={containerRef}
         className="flex-1 overflow-auto p-4 font-mono text-sm"
       >
+        {/* Show previous turns in the current episode */}
+        {previousTurnsInEpisode.length > 0 && isStreaming && (
+          <div className="mb-4">
+            <h3 className="text-xs font-medium text-gray-500 uppercase tracking-wide mb-2">
+              Previous Turns (this episode)
+            </h3>
+            <div className="space-y-2">
+              {previousTurnsInEpisode.map((log, i) => (
+                <details key={i} className="bg-gray-800/50 rounded-lg border border-gray-700/50">
+                  <summary className="px-3 py-2 cursor-pointer text-xs text-gray-400 hover:text-gray-300">
+                    <span className="ml-1">
+                      Turn {log.turn ?? (i + 1)}
+                      {log.reward !== undefined && ` | R=${log.reward.toFixed(2)}`}
+                      {log.solved && ' (solved)'}
+                    </span>
+                  </summary>
+                  <pre className="px-4 py-2 text-xs text-gray-400 whitespace-pre-wrap max-h-40 overflow-auto">
+                    {log.full_text?.slice(0, 500)}{(log.full_text?.length || 0) > 500 ? '...' : ''}
+                  </pre>
+                </details>
+              ))}
+            </div>
+          </div>
+        )}
+
         {displayText ? (
           <div className="bg-gray-800 rounded-lg p-4 whitespace-pre-wrap border border-gray-700">
             <span className="text-gray-300">{displayText}</span>
@@ -106,7 +138,7 @@ function LiveGeneration({ text, logs }: LiveGenerationProps) {
             <span className="text-xs">Click "Start Training" to begin.</span>
           </div>
         )}
-        
+
         {/* Show episode history below current generation */}
         {generationLogs.length > 1 && !isStreaming && (
           <div className="mt-6">
@@ -118,9 +150,11 @@ function LiveGeneration({ text, logs }: LiveGenerationProps) {
                 <details key={i} className="bg-gray-800/50 rounded-lg border border-gray-700/50">
                   <summary className="px-3 py-2 cursor-pointer text-xs text-gray-400 hover:text-gray-300">
                     <span className="ml-1">
-                      {log.pr_id} • Episode {log.turn || log.episode} 
-                      {log.reward !== undefined && ` • R=${log.reward.toFixed(2)}`}
-                      {log.solved && ' ✓'}
+                      {log.pr_id}
+                      {log.group_idx ? ` | Group ${log.group_idx}` : ''}
+                      {log.turn ? ` | Turn ${log.turn}` : log.turns ? ` | ${log.turns} turns` : ''}
+                      {log.reward !== undefined && ` | R=${log.reward.toFixed(2)}`}
+                      {log.solved && ' (solved)'}
                     </span>
                   </summary>
                   <pre className="px-4 py-2 text-xs text-gray-400 whitespace-pre-wrap max-h-40 overflow-auto">
