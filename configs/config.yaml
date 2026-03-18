@@ -56,7 +56,7 @@ training:
 # Environment Configuration  
 environment:
   mode: "multi_turn"  # single_turn or multi_turn
-  max_turns: 10  # max turns per episode for multi-turn
+  max_turns: 5  # max turns per episode for multi-turn
   timeout_seconds: 60
   
   # Sandbox configuration (Python subprocess)

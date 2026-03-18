@@ -135,8 +135,11 @@ class LLMPolicy:
         if quant_config:
             model_kwargs["quantization_config"] = quant_config
             model_kwargs["device_map"] = "auto"
+        elif self.device == "cuda":
+            # Use device_map="auto" on CUDA to handle models that don't fit in VRAM
+            model_kwargs["device_map"] = "auto"
         else:
-            # For MPS/CPU or no quantization
+            # For MPS/CPU
             model_kwargs["device_map"] = None
         
         self.model = AutoModelForCausalLM.from_pretrained(
