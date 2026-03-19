@@ -48,6 +48,8 @@ logger = get_logger(__name__)
 # Request/Response models
 class TrainingStartRequest(BaseModel):
     config_overrides: Optional[Dict[str, Any]] = None
+    phased: bool = False
+    start_phase: int = 1
 
 
 class TrainingStatus(BaseModel):
@@ -59,6 +61,9 @@ class TrainingStatus(BaseModel):
     avg_reward: float
     elapsed_time: float
     device: str = "auto"
+    current_phase: int = 0
+    phase_name: str = ""
+    phase_progress: Optional[Dict[str, Any]] = None
 
 
 class PRInfo(BaseModel):
@@ -98,6 +103,10 @@ class ServerState:
         self._recent_grad_norms: collections.deque = collections.deque(maxlen=100)
         # Episode lengths
         self._episode_lengths: collections.deque = collections.deque(maxlen=100)
+        # Phase tracking
+        self.current_phase: int = 0  # 0 = regular, 1-5 = phased
+        self.phase_name: str = ""
+        self.phase_reward_history: collections.deque = collections.deque(maxlen=10)
 
 
 state = ServerState()
@@ -209,6 +218,26 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
         else:
             device = "CPU"
 
+        # Build phase progress info
+        phase_progress = None
+        if state.current_phase > 0:
+            rewards_list = list(state.phase_reward_history)
+            # Import phase config for threshold info
+            try:
+                from ..data.phase_config import DEFAULT_PHASES
+                pcfg = DEFAULT_PHASES.get(state.current_phase)
+                if pcfg:
+                    met = sum(1 for r in rewards_list if r >= pcfg.advancement_threshold)
+                    phase_progress = {
+                        'recent_rewards': [_sanitize_floats(r) for r in rewards_list],
+                        'threshold': pcfg.advancement_threshold,
+                        'required': pcfg.advancement_required,
+                        'met': met,
+                        'window': pcfg.advancement_window
+                    }
+            except Exception:
+                pass
+
         return TrainingStatus(
             is_running=state.is_training,
             current_step=state.training_stats.get('total_steps', 0),
@@ -217,7 +246,10 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
             solved_prs=state.training_stats.get('solved_prs', []),
             avg_reward=_sanitize_floats(state.training_stats.get('avg_reward', 0.0)),
             elapsed_time=elapsed,
-            device=device
+            device=device,
+            current_phase=state.current_phase,
+            phase_name=state.phase_name,
+            phase_progress=phase_progress
         )
 
     @app.get("/api/prs")
@@ -322,6 +354,9 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
         state._recent_grad_norms.clear()
         state._episode_lengths.clear()
 
+        is_phased = request.phased
+        start_phase = request.start_phase
+
         # Run training in thread pool to avoid blocking
         def run_training_sync():
             from ..agent import LLMPolicy, GRPOTrainer
@@ -343,10 +378,6 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
                     cache_path=state.config.cache_path
                 )
 
-                curriculum = CurriculumManager(state.config, loader)
-                env = CodeEnv(state.config, repo_manager)
-                _append_log({'type': 'info', 'message': 'Environment ready'})
-
                 logger.info("Loading model (this may take a few minutes)...")
                 _append_log({'type': 'info', 'message': 'Loading model...'})
                 policy = LLMPolicy(state.config)
@@ -355,18 +386,6 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
                 policy.setup_lora()
                 logger.info("Model loaded successfully!")
                 _append_log({'type': 'info', 'message': 'LoRA ready!'})
-
-                # Create GRPO trainer
-                _append_log({'type': 'info', 'message': 'Using GRPO algorithm'})
-                trainer = GRPOTrainer(
-                    config=state.config,
-                    policy=policy,
-                    env=env,
-                    pr_tasks=curriculum.get_remaining_tasks()
-                )
-
-                # Store reference for stop signaling
-                state.trainer = trainer
 
                 # Set callback for updates
                 def thread_safe_broadcast(data: Dict[str, Any]):
@@ -382,14 +401,10 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
                         metrics = data.get('metrics', {})
                         state.training_stats['total_steps'] = data.get('step', 0)
                         state.training_stats['solve_rate'] = metrics.get('solve_rate', 0)
-                        # Do NOT overwrite avg_reward from step events;
-                        # the incremental average maintained from episodes is authoritative.
-                        # Only seed it if we have no episode data yet.
                         if state._reward_count == 0:
                             state.training_stats['avg_reward'] = metrics.get(
                                 'avg_reward', metrics.get('mean_reward', 0)
                             )
-                        # Track gradient norms
                         grad_norm = metrics.get('grad_norm')
                         if grad_norm is not None:
                             state._recent_grad_norms.append(grad_norm)
@@ -399,34 +414,33 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
                         state.training_stats['current_pr_id'] = data.get('pr_id')
 
                         reward = data.get('reward', 0)
-                        # Proper incremental average
                         state._reward_count += 1
                         state._reward_sum += reward
                         state.training_stats['avg_reward'] = state._reward_sum / state._reward_count
                         state.recent_rewards.append(reward)
+                        state.phase_reward_history.append(reward)
 
-                        # Track episode length
                         ep_len = data.get('turns', data.get('length'))
                         if ep_len is not None:
                             state._episode_lengths.append(ep_len)
 
-                        # Update best_rewards
                         pr_id = data.get('pr_id')
                         if pr_id:
                             best_rewards = state.training_stats.setdefault('best_rewards', {})
                             if reward > best_rewards.get(pr_id, float('-inf')):
                                 best_rewards[pr_id] = reward
-
-                            # Update attempts_per_pr
                             attempts = state.training_stats.setdefault('attempts_per_pr', {})
                             attempts[pr_id] = attempts.get(pr_id, 0) + 1
 
+                    elif data.get('type') == 'phase_change':
+                        state.current_phase = data.get('phase', 0)
+                        state.phase_name = data.get('name', '')
+                        state.phase_reward_history.clear()
+
                     elif data.get('type') == 'generation_token':
-                        # Update current PR immediately when generation starts
                         if data.get('pr_id'):
                             state.training_stats['current_pr_id'] = data.get('pr_id')
                     elif data.get('type') == 'generation_complete':
-                        # Update current group info
                         state.training_stats['current_group'] = data.get('group_idx', 0)
                         state.training_stats['current_pr_id'] = data.get('pr_id')
                     elif data.get('type') == 'pr_solved':
@@ -435,18 +449,133 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
                             solved.append(data.get('pr_id'))
                         state.training_stats['solved_prs'] = solved
 
-                trainer.set_websocket_callback(thread_safe_broadcast)
+                if is_phased:
+                    # ---- PHASED TRAINING ----
+                    from ..environment.phase_env import PhaseOneEnv, PhaseTwoEnv, PhaseThreeEnv
+                    from ..data.phase_config import DEFAULT_PHASES
 
-                _append_log({'type': 'info', 'message': 'Starting training loop...'})
+                    PHASE_NAMES = {
+                        1: "Code Completion", 2: "Tool Format",
+                        3: "Read Then Write", 4: "Full Tool Chain",
+                        5: "Full Curriculum"
+                    }
 
-                # Run training
-                result = trainer.train()
+                    for phase_num in range(start_phase, 6):
+                        if state.stop_training_flag:
+                            break
 
-                state.training_stats = result.get('stats', {})
-                _append_log({
-                    'type': 'training_complete',
-                    'result': result
-                })
+                        phase_cfg = DEFAULT_PHASES[phase_num]
+                        state.current_phase = phase_num
+                        state.phase_name = PHASE_NAMES[phase_num]
+                        state.phase_reward_history.clear()
+
+                        _append_log({'type': 'info', 'message': f'=== Phase {phase_num}: {PHASE_NAMES[phase_num]} ==='})
+                        thread_safe_broadcast({
+                            'type': 'phase_change',
+                            'phase': phase_num,
+                            'name': PHASE_NAMES[phase_num]
+                        })
+
+                        # Create phase-appropriate environment
+                        if phase_num == 1:
+                            env = PhaseOneEnv(state.config, repo_manager)
+                        elif phase_num == 2:
+                            env = PhaseTwoEnv(state.config, repo_manager)
+                        elif phase_num == 3:
+                            env = PhaseThreeEnv(state.config, repo_manager)
+                        else:
+                            env = CodeEnv(state.config, repo_manager)
+
+                        # Override config for this phase
+                        orig_max_turns = state.config.environment.max_turns
+                        orig_group_size = state.config.training.grpo.group_size
+                        state.config.environment.max_turns = phase_cfg.max_turns
+                        state.config.training.grpo.group_size = phase_cfg.group_size
+
+                        # Get tasks for this phase
+                        if phase_cfg.pr_ids == ["all"]:
+                            tasks = loader.load_in_curriculum_order()
+                        else:
+                            tasks = [loader.load_pr(pr_id) for pr_id in phase_cfg.pr_ids]
+
+                        curriculum = CurriculumManager(state.config, loader)
+
+                        trainer = GRPOTrainer(
+                            config=state.config,
+                            policy=policy,
+                            env=env,
+                            pr_tasks=tasks
+                        )
+                        state.trainer = trainer
+                        trainer.set_websocket_callback(thread_safe_broadcast)
+
+                        _append_log({'type': 'info', 'message': f'Phase {phase_num}: Training started (max_turns={phase_cfg.max_turns}, group_size={phase_cfg.group_size})'})
+
+                        # Train with advancement checking
+                        max_steps = 500
+                        step = 0
+                        advanced = False
+
+                        while step < max_steps and not state.stop_training_flag:
+                            task = tasks[0] if tasks else None
+                            if task is None:
+                                break
+
+                            rollouts = trainer._collect_rollouts(task)
+                            if not rollouts:
+                                continue
+
+                            update_stats = trainer._grpo_update(rollouts)
+                            trainer._log_progress(rollouts, update_stats)
+                            step += 1
+
+                            # Check advancement
+                            rewards_in_window = list(state.phase_reward_history)
+                            if len(rewards_in_window) >= phase_cfg.advancement_required:
+                                met = sum(1 for r in rewards_in_window if r >= phase_cfg.advancement_threshold)
+                                if met >= phase_cfg.advancement_required:
+                                    _append_log({'type': 'info', 'message': f'Phase {phase_num} COMPLETE! ({met} of {len(rewards_in_window)} above {phase_cfg.advancement_threshold})'})
+                                    advanced = True
+                                    break
+
+                        # Save phase checkpoint
+                        checkpoint_dir = Path(state.config.paths.checkpoints) / f"phase_{phase_num}"
+                        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                        policy.save(str(checkpoint_dir / "model"))
+                        _append_log({'type': 'info', 'message': f'Phase {phase_num} checkpoint saved'})
+
+                        # Restore config
+                        state.config.environment.max_turns = orig_max_turns
+                        state.config.training.grpo.group_size = orig_group_size
+
+                        env.cleanup()
+
+                        if not advanced and not state.stop_training_flag:
+                            _append_log({'type': 'info', 'message': f'Phase {phase_num}: Max steps reached without advancement, continuing to next phase'})
+
+                    _append_log({'type': 'training_complete', 'result': {'mode': 'phased', 'final_phase': state.current_phase}})
+
+                else:
+                    # ---- REGULAR TRAINING ----
+                    curriculum = CurriculumManager(state.config, loader)
+                    env = CodeEnv(state.config, repo_manager)
+                    _append_log({'type': 'info', 'message': 'Environment ready'})
+
+                    _append_log({'type': 'info', 'message': 'Using GRPO algorithm'})
+                    trainer = GRPOTrainer(
+                        config=state.config,
+                        policy=policy,
+                        env=env,
+                        pr_tasks=curriculum.get_remaining_tasks()
+                    )
+                    state.trainer = trainer
+                    trainer.set_websocket_callback(thread_safe_broadcast)
+
+                    _append_log({'type': 'info', 'message': 'Starting training loop...'})
+                    result = trainer.train()
+
+                    state.training_stats = result.get('stats', {})
+                    _append_log({'type': 'training_complete', 'result': result})
 
             except Exception as e:
                 logger.error(f"Training error: {e}")
@@ -459,6 +588,8 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
             finally:
                 state.is_training = False
                 state.trainer = None
+                state.current_phase = 0
+                state.phase_name = ""
                 loop.close()
 
         # Start in thread pool
