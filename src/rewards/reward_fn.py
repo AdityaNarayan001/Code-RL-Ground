@@ -166,23 +166,25 @@ class RewardFunction:
         for filepath, content in files.items():
             if not filepath.endswith('.py'):
                 continue
+            # Skip files that aren't pure source modules
+            basename = Path(filepath).name
+            if basename in ('setup.py', '__main__.py', '__init__.py'):
+                continue
+            # Skip test files (they import the package which isn't available in exec context)
+            if basename.startswith('test_') or '/tests/' in filepath or filepath.startswith('tests/'):
+                continue
             try:
-                # Compile and exec in an isolated module to catch ImportError
-                # Skip setup.py and non-source files that may call sys.exit
-                if filepath.endswith('setup.py') or filepath.endswith('__main__.py'):
-                    continue
                 code = compile(content, filepath, 'exec')
-                module = types.ModuleType(f'_import_check_{filepath}')
+                # Use a clean module name (no slashes)
+                mod_name = f'_import_check_{basename}'
+                module = types.ModuleType(mod_name)
                 module.__file__ = filepath
-                # We only check for ImportError, not execution errors
                 exec(code, module.__dict__)
             except ImportError:
                 return False
             except (SystemExit, KeyboardInterrupt):
-                # setup.py and similar scripts call sys.exit — skip them
                 pass
             except Exception:
-                # Other errors (NameError, etc.) are not import issues
                 pass
         return True
 

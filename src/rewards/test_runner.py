@@ -282,10 +282,15 @@ assert result == {repr(expected)}, f"Expected {repr(expected)}, got {{result}}"
         if expected_function:
             return expected_function
 
-        # Collect all functions from current code
+        # Collect all functions from current code (skip test files, setup.py, __init__.py)
         current_funcs = []
         for filepath, content in code_files.items():
             if not filepath.endswith('.py'):
+                continue
+            basename = filepath.split('/')[-1]
+            if basename.startswith('test_') or basename in ('setup.py', '__init__.py'):
+                continue
+            if '/tests/' in filepath or filepath.startswith('tests/'):
                 continue
             for match in re.finditer(r'^def\s+(\w+)\s*\(', content, re.MULTILINE):
                 func_name = match.group(1)
@@ -327,22 +332,34 @@ assert result == {repr(expected)}, f"Expected {repr(expected)}, got {{result}}"
         return func_names
 
     def _get_imports(self, code_files: Dict[str, str]) -> List[str]:
-        """Get import statements for code files."""
+        """Get import statements for code files.
+
+        Only imports source modules, skipping test files, setup.py, and __init__.py.
+        """
         imports = []
 
         for filepath in code_files:
-            if filepath.endswith('.py') and not filepath.startswith('_'):
-                # Convert path to module name
-                module = filepath.replace('/', '.').replace('\\', '.')[:-3]
-                if module.startswith('.'):
-                    module = module[1:]
+            if not filepath.endswith('.py'):
+                continue
+            # Skip non-source files
+            basename = filepath.split('/')[-1]
+            if basename.startswith('_') or basename.startswith('test_') or basename == 'setup.py':
+                continue
+            # Skip test directories
+            if '/tests/' in filepath or filepath.startswith('tests/'):
+                continue
 
-                # Handle __init__.py
-                if module.endswith('.__init__'):
-                    module = module[:-9]
+            # Convert path to module name
+            module = filepath.replace('/', '.').replace('\\', '.')[:-3]
+            if module.startswith('.'):
+                module = module[1:]
 
-                if module:
-                    imports.append(f"from {module} import *")
+            # Handle __init__.py
+            if module.endswith('.__init__'):
+                module = module[:-9]
+
+            if module:
+                imports.append(f"from {module} import *")
 
         return imports
 

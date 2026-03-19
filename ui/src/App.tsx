@@ -43,7 +43,11 @@ function App() {
       if (statusRes.ok) {
         const statusData = await statusRes.json()
         setStatus(statusData)
-        if (statusData.phase) setPhaseInfo(statusData.phase)
+        if (statusData.current_phase) setPhaseInfo({
+          current_phase: statusData.current_phase,
+          phase_name: statusData.phase_name || '',
+          advancement_progress: statusData.phase_progress || { recent_rewards: [], threshold: 0, required: 0, met: 0, window: 0 },
+        })
       }
       if (prsRes.ok) setPrs(await prsRes.json())
       if (metricsRes.ok) setMetrics(await metricsRes.json())
@@ -139,20 +143,20 @@ function App() {
             setGeneratingText(data.full_text || '')
             // Fetch status on first turn to update current PR immediately
             if (data.turn === 1) {
-              fetch('/api/status').then(r => r.json()).then(s => { setStatus(s); if (s.phase) setPhaseInfo(s.phase) }).catch(() => {})
+              fetch('/api/status').then(r => r.json()).then(s => { setStatus(s); if (s.current_phase) setPhaseInfo({ current_phase: s.current_phase, phase_name: s.phase_name || '', advancement_progress: s.phase_progress || { recent_rewards: [], threshold: 0, required: 0, met: 0, window: 0 } }) }).catch(() => {})
             }
             break
           case 'generation_complete':
             setGeneratingText('')
             // Also refresh metrics and status
             fetch('/api/metrics').then(r => r.json()).then(setMetrics).catch(() => {})
-            fetch('/api/status').then(r => r.json()).then(s => { setStatus(s); if (s.phase) setPhaseInfo(s.phase) }).catch(() => {})
+            fetch('/api/status').then(r => r.json()).then(s => { setStatus(s); if (s.current_phase) setPhaseInfo({ current_phase: s.current_phase, phase_name: s.phase_name || '', advancement_progress: s.phase_progress || { recent_rewards: [], threshold: 0, required: 0, met: 0, window: 0 } }) }).catch(() => {})
             break
           case 'step':
           case 'episode':
             // Refresh metrics and status
             fetch('/api/metrics').then(r => r.json()).then(setMetrics).catch(() => {})
-            fetch('/api/status').then(r => r.json()).then(s => { setStatus(s); if (s.phase) setPhaseInfo(s.phase) }).catch(() => {})
+            fetch('/api/status').then(r => r.json()).then(s => { setStatus(s); if (s.current_phase) setPhaseInfo({ current_phase: s.current_phase, phase_name: s.phase_name || '', advancement_progress: s.phase_progress || { recent_rewards: [], threshold: 0, required: 0, met: 0, window: 0 } }) }).catch(() => {})
             break
           case 'pr_solved':
             // Refresh PRs and status

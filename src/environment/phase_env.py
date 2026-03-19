@@ -58,8 +58,10 @@ class PhaseOneEnv:
         # Get repository state with dependencies applied
         self.current_state = self.repo_manager.get_state_for_pr(pr_id, dependency_prs)
 
-        # Create working directory
+        # Create working directory (resolve to absolute path)
         self.working_dir = self.repo_manager.create_working_directory(self.current_state)
+        if not self.working_dir.is_absolute():
+            self.working_dir = self.working_dir.resolve()
 
         # Read file content for files in pr_data['files_changed']
         files_changed = pr_data.get('files_changed', [])
@@ -256,8 +258,10 @@ class PhaseTwoEnv:
         # Get repository state with dependencies applied
         self.current_state = self.repo_manager.get_state_for_pr(pr_id, dependency_prs)
 
-        # Create working directory
+        # Create working directory (resolve to absolute path)
         self.working_dir = self.repo_manager.create_working_directory(self.current_state)
+        if not self.working_dir.is_absolute():
+            self.working_dir = self.working_dir.resolve()
 
         # Read file content for files in pr_data['files_changed']
         files_changed = pr_data.get('files_changed', [])
