@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import Dashboard from './components/Dashboard'
-import { TrainingStatus, PRInfo, WSMessage, TrainingMetrics, AdvancedMetrics } from './types'
+import { TrainingStatus, PRInfo, WSMessage, TrainingMetrics, AdvancedMetrics, PhaseInfo } from './types'
 
 function App() {
   const [status, setStatus] = useState<TrainingStatus | null>(null)
@@ -11,6 +11,8 @@ function App() {
   const [connected, setConnected] = useState(false)
   const [advancedMetrics, setAdvancedMetrics] = useState<AdvancedMetrics | null>(null)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
+  const [phaseInfo, setPhaseInfo] = useState<PhaseInfo | null>(null)
+  const [phaseBanner, setPhaseBanner] = useState<string | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
   const reconnectDelayRef = useRef(1000)
   const pongTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -22,6 +24,13 @@ function App() {
     return () => clearTimeout(t)
   }, [errorMessage])
 
+  // Clear phase banner after 5 seconds
+  useEffect(() => {
+    if (!phaseBanner) return
+    const t = setTimeout(() => setPhaseBanner(null), 5000)
+    return () => clearTimeout(t)
+  }, [phaseBanner])
+
   // Fetch initial data
   const fetchData = useCallback(async () => {
     try {
@@ -31,7 +40,11 @@ function App() {
         fetch('/api/metrics'),
       ])
 
-      if (statusRes.ok) setStatus(await statusRes.json())
+      if (statusRes.ok) {
+        const statusData = await statusRes.json()
+        setStatus(statusData)
+        if (statusData.phase) setPhaseInfo(statusData.phase)
+      }
       if (prsRes.ok) setPrs(await prsRes.json())
       if (metricsRes.ok) setMetrics(await metricsRes.json())
     } catch (err) {
@@ -126,20 +139,20 @@ function App() {
             setGeneratingText(data.full_text || '')
             // Fetch status on first turn to update current PR immediately
             if (data.turn === 1) {
-              fetch('/api/status').then(r => r.json()).then(setStatus).catch(() => {})
+              fetch('/api/status').then(r => r.json()).then(s => { setStatus(s); if (s.phase) setPhaseInfo(s.phase) }).catch(() => {})
             }
             break
           case 'generation_complete':
             setGeneratingText('')
             // Also refresh metrics and status
             fetch('/api/metrics').then(r => r.json()).then(setMetrics).catch(() => {})
-            fetch('/api/status').then(r => r.json()).then(setStatus).catch(() => {})
+            fetch('/api/status').then(r => r.json()).then(s => { setStatus(s); if (s.phase) setPhaseInfo(s.phase) }).catch(() => {})
             break
           case 'step':
           case 'episode':
             // Refresh metrics and status
             fetch('/api/metrics').then(r => r.json()).then(setMetrics).catch(() => {})
-            fetch('/api/status').then(r => r.json()).then(setStatus).catch(() => {})
+            fetch('/api/status').then(r => r.json()).then(s => { setStatus(s); if (s.phase) setPhaseInfo(s.phase) }).catch(() => {})
             break
           case 'pr_solved':
             // Refresh PRs and status
@@ -152,6 +165,25 @@ function App() {
             }
             fetchData()
             break
+          case 'phase_change': {
+            const newPhase: PhaseInfo = {
+              current_phase: data.new_phase ?? data.current_phase ?? 0,
+              phase_name: data.phase_name ?? data.new_phase_name ?? '',
+              advancement_progress: data.advancement_progress ?? {
+                recent_rewards: [],
+                threshold: 0,
+                required: 0,
+                met: 0,
+                window: 0,
+              },
+            }
+            setPhaseInfo(newPhase)
+            const prevName = data.previous_phase_name ?? data.old_phase_name ?? `Phase ${(data.old_phase ?? (newPhase.current_phase - 1))}`
+            setPhaseBanner(`Phase ${data.old_phase ?? (newPhase.current_phase - 1)} Complete! Advancing to Phase ${newPhase.current_phase}: ${newPhase.phase_name}`)
+            void prevName // consumed above as fallback
+            fetchData()
+            break
+          }
           case 'error':
             setErrorMessage(data.message || data.error || 'An error occurred')
             break
@@ -219,6 +251,25 @@ function App() {
     }
   }
 
+  const startPhasedTraining = async () => {
+    try {
+      const res = await fetch('/api/training/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phased: true }),
+      })
+      if (res.ok) {
+        fetchData()
+      } else {
+        const body = await res.text()
+        setErrorMessage(`Failed to start phased training: ${body}`)
+      }
+    } catch (err) {
+      console.error('Failed to start phased training:', err)
+      setErrorMessage('Failed to start phased training. Is the server running?')
+    }
+  }
+
   const stopTraining = async () => {
     try {
       const res = await fetch('/api/training/stop', { method: 'POST' })
@@ -244,9 +295,12 @@ function App() {
         generatingText={generatingText}
         connected={connected}
         onStartTraining={startTraining}
+        onStartPhasedTraining={startPhasedTraining}
         onStopTraining={stopTraining}
         advancedMetrics={advancedMetrics}
         errorMessage={errorMessage}
+        phaseInfo={phaseInfo}
+        phaseBanner={phaseBanner}
       />
     </div>
   )

@@ -1,3 +1,17 @@
+export interface PhaseAdvancementProgress {
+  recent_rewards: number[]
+  threshold: number
+  required: number
+  met: number
+  window: number
+}
+
+export interface PhaseInfo {
+  current_phase: number       // 0=legacy, 1-5
+  phase_name: string          // "Code Completion", "Tool Format", etc.
+  advancement_progress: PhaseAdvancementProgress
+}
+
 export interface TrainingStatus {
   is_running: boolean
   current_step: number
@@ -7,6 +21,7 @@ export interface TrainingStatus {
   avg_reward: number
   elapsed_time: number
   device: string
+  phase?: PhaseInfo
 }
 
 export interface PRInfo {

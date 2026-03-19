@@ -1,5 +1,5 @@
-import { TrendingUp, Target, Layers, Activity, Timer, BarChart3, Gauge } from 'lucide-react'
-import { AdvancedMetrics, StepMetric } from '../types'
+import { TrendingUp, Target, Layers, Activity, Timer, BarChart3, Gauge, GitBranch } from 'lucide-react'
+import { AdvancedMetrics, StepMetric, PhaseInfo } from '../types'
 
 interface MetricsPanelProps {
   avgReward: number
@@ -8,6 +8,7 @@ interface MetricsPanelProps {
   step: number
   advancedMetrics?: AdvancedMetrics | null
   latestSteps?: StepMetric[]
+  phaseInfo?: PhaseInfo | null
 }
 
 function Sparkline({ values, height = 20, width = 80 }: { values: number[]; height?: number; width?: number }) {
@@ -37,7 +38,7 @@ function Sparkline({ values, height = 20, width = 80 }: { values: number[]; heig
   )
 }
 
-function MetricsPanel({ avgReward, solvedPRs, totalPRs, step, advancedMetrics, latestSteps }: MetricsPanelProps) {
+function MetricsPanel({ avgReward, solvedPRs, totalPRs, step, advancedMetrics, latestSteps, phaseInfo }: MetricsPanelProps) {
   const progress = totalPRs > 0 ? (solvedPRs / totalPRs) * 100 : 0
 
   // Derive gradient variance and step timing from latest steps if available
@@ -131,6 +132,44 @@ function MetricsPanel({ avgReward, solvedPRs, totalPRs, step, advancedMetrics, l
           </div>
         )}
       </div>
+
+      {/* Phase advancement metrics */}
+      {phaseInfo && phaseInfo.current_phase > 0 && (
+        <div className="space-y-2 text-xs border-t border-gray-700 pt-3">
+          <div className="flex justify-between items-center text-gray-400">
+            <span className="flex items-center gap-1"><GitBranch size={12} /> Phase</span>
+            <span className="text-gray-200 font-mono">{phaseInfo.current_phase}: {phaseInfo.phase_name}</span>
+          </div>
+          {phaseInfo.advancement_progress && (
+            <>
+              <div className="flex justify-between items-center text-gray-400">
+                <span className="flex items-center gap-1"><Target size={12} /> Advancement</span>
+                <span className="text-gray-200 font-mono">
+                  {phaseInfo.advancement_progress.met}/{phaseInfo.advancement_progress.required} above {phaseInfo.advancement_progress.threshold.toFixed(2)}
+                </span>
+              </div>
+              {phaseInfo.advancement_progress.recent_rewards.length > 0 && (
+                <div className="flex items-center gap-1 mt-1">
+                  {phaseInfo.advancement_progress.recent_rewards.map((r, i) => (
+                    <div
+                      key={i}
+                      className={`w-2.5 h-2.5 rounded-full ${
+                        r >= phaseInfo.advancement_progress.threshold
+                          ? 'bg-green-400'
+                          : 'bg-red-400'
+                      }`}
+                      title={`${r.toFixed(3)}`}
+                    />
+                  ))}
+                  {Array.from({ length: Math.max(0, phaseInfo.advancement_progress.window - phaseInfo.advancement_progress.recent_rewards.length) }).map((_, i) => (
+                    <div key={`e-${i}`} className="w-2.5 h-2.5 rounded-full bg-gray-600" />
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
 
       {/* Progress bar */}
       <div className="mt-auto pt-3 border-t border-gray-700">
