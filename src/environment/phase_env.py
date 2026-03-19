@@ -178,6 +178,14 @@ class PhaseOneEnv:
 
         return obs
 
+    def parse_action(self, text: str) -> Action:
+        """Parse model output as a simple text action (no tool parsing in Phase 1)."""
+        return Action(action_type=ActionType.SUBMIT, raw_output=text, text=text)
+
+    def get_episode(self) -> Optional[Episode]:
+        """Return current episode."""
+        return self.current_episode
+
     def cleanup(self):
         """Clean up temporary working directory."""
         if self.working_dir and self.repo_manager:
@@ -403,6 +411,14 @@ class PhaseTwoEnv:
 
         return obs
 
+    def parse_action(self, text: str) -> Action:
+        """Parse model output — check for tool format."""
+        return Action(action_type=ActionType.SUBMIT, raw_output=text, text=text)
+
+    def get_episode(self) -> Optional[Episode]:
+        """Return current episode."""
+        return self.current_episode
+
     def cleanup(self):
         """Clean up temporary working directory."""
         if self.working_dir and self.repo_manager:
@@ -510,6 +526,14 @@ class PhaseThreeEnv:
 
             obs.info['read_bonus'] = self.read_bonus
             return obs
+
+    def parse_action(self, text: str) -> Action:
+        """Delegate to inner env."""
+        return self.inner_env.parse_action(text)
+
+    def get_episode(self) -> Optional[Episode]:
+        """Delegate to inner env."""
+        return self.inner_env.current_episode
 
     def cleanup(self):
         """Delegate cleanup to inner env."""

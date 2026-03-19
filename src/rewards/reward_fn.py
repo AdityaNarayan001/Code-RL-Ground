@@ -168,6 +168,9 @@ class RewardFunction:
                 continue
             try:
                 # Compile and exec in an isolated module to catch ImportError
+                # Skip setup.py and non-source files that may call sys.exit
+                if filepath.endswith('setup.py') or filepath.endswith('__main__.py'):
+                    continue
                 code = compile(content, filepath, 'exec')
                 module = types.ModuleType(f'_import_check_{filepath}')
                 module.__file__ = filepath
@@ -175,6 +178,9 @@ class RewardFunction:
                 exec(code, module.__dict__)
             except ImportError:
                 return False
+            except (SystemExit, KeyboardInterrupt):
+                # setup.py and similar scripts call sys.exit — skip them
+                pass
             except Exception:
                 # Other errors (NameError, etc.) are not import issues
                 pass

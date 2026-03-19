@@ -959,13 +959,19 @@ class GRPOTrainer:
     
     def _get_system_prompt(self) -> str:
         """Get system prompt for the agent.
-        
-        Optimized for small models (0.5B-3B):
-        - Short and direct
-        - Format shown before explanation
-        - One concrete example with exact syntax
-        - Strong anchoring on the <tool>...</tool> pattern
+
+        Phase-aware: returns different prompts based on the environment type.
         """
+        # Check if we're in a phase env that doesn't need tool instructions
+        from ..environment.phase_env import PhaseOneEnv, PhaseTwoEnv
+        if isinstance(self.env, PhaseOneEnv):
+            return "You are a Python developer. Output ONLY valid Python code. No explanations, no markdown fences, no tool calls."
+        if isinstance(self.env, PhaseTwoEnv):
+            return """You are a code assistant. Write files using this EXACT format:
+<tool>write_file(path="filename.py", content="...file content...")</tool>
+
+Output ONLY the tool call. Nothing else."""
+
         return """You are a code assistant. You solve tasks by calling tools.
 
 ALWAYS use this EXACT format:

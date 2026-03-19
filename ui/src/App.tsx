@@ -166,9 +166,11 @@ function App() {
             fetchData()
             break
           case 'phase_change': {
+            const phaseNum = data.phase ?? data.new_phase ?? data.current_phase ?? 0
+            const phaseName = data.name ?? data.phase_name ?? ''
             const newPhase: PhaseInfo = {
-              current_phase: data.new_phase ?? data.current_phase ?? 0,
-              phase_name: data.phase_name ?? data.new_phase_name ?? '',
+              current_phase: phaseNum,
+              phase_name: phaseName,
               advancement_progress: data.advancement_progress ?? {
                 recent_rewards: [],
                 threshold: 0,
@@ -178,9 +180,11 @@ function App() {
               },
             }
             setPhaseInfo(newPhase)
-            const prevName = data.previous_phase_name ?? data.old_phase_name ?? `Phase ${(data.old_phase ?? (newPhase.current_phase - 1))}`
-            setPhaseBanner(`Phase ${data.old_phase ?? (newPhase.current_phase - 1)} Complete! Advancing to Phase ${newPhase.current_phase}: ${newPhase.phase_name}`)
-            void prevName // consumed above as fallback
+            if (phaseNum > 1) {
+              setPhaseBanner(`Phase ${phaseNum - 1} Complete! Advancing to Phase ${phaseNum}: ${phaseName}`)
+            } else {
+              setPhaseBanner(`Starting Phase ${phaseNum}: ${phaseName}`)
+            }
             fetchData()
             break
           }

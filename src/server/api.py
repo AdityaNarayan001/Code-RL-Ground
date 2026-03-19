@@ -525,6 +525,7 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
                             if not rollouts:
                                 continue
 
+                            trainer._compute_advantages(rollouts)
                             update_stats = trainer._grpo_update(rollouts)
                             trainer._log_progress(rollouts, update_stats)
                             step += 1
