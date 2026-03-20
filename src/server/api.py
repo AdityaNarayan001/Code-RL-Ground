@@ -224,8 +224,9 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
             rewards_list = list(state.phase_reward_history)
             # Import phase config for threshold info
             try:
-                from ..data.phase_config import DEFAULT_PHASES
-                pcfg = DEFAULT_PHASES.get(state.current_phase)
+                from ..data.phase_config import load_phases_from_config
+                phases = load_phases_from_config(state.config)
+                pcfg = phases.get(state.current_phase)
                 if pcfg:
                     met = sum(1 for r in rewards_list if r >= pcfg.advancement_threshold)
                     phase_progress = {
@@ -452,28 +453,26 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
                 if is_phased:
                     # ---- PHASED TRAINING ----
                     from ..environment.phase_env import PhaseOneEnv, PhaseTwoEnv, PhaseThreeEnv
-                    from ..data.phase_config import DEFAULT_PHASES
+                    from ..data.phase_config import DEFAULT_PHASES, load_phases_from_config
 
-                    PHASE_NAMES = {
-                        1: "Code Completion", 2: "Tool Format",
-                        3: "Read Then Write", 4: "Full Tool Chain",
-                        5: "Full Curriculum"
-                    }
+                    PHASES = load_phases_from_config(state.config)
 
-                    for phase_num in range(start_phase, 6):
+                    for phase_num in sorted(PHASES.keys()):
+                        if phase_num < start_phase:
+                            continue
                         if state.stop_training_flag:
                             break
 
-                        phase_cfg = DEFAULT_PHASES[phase_num]
+                        phase_cfg = PHASES[phase_num]
                         state.current_phase = phase_num
-                        state.phase_name = PHASE_NAMES[phase_num]
+                        state.phase_name = PHASES[phase_num].name
                         state.phase_reward_history.clear()
 
-                        _append_log({'type': 'info', 'message': f'=== Phase {phase_num}: {PHASE_NAMES[phase_num]} ==='})
+                        _append_log({'type': 'info', 'message': f'=== Phase {phase_num}: {PHASES[phase_num].name} ==='})
                         thread_safe_broadcast({
                             'type': 'phase_change',
                             'phase': phase_num,
-                            'name': PHASE_NAMES[phase_num]
+                            'name': PHASES[phase_num].name
                         })
 
                         # Create phase-appropriate environment
@@ -794,15 +793,22 @@ def _append_log(entry: Dict[str, Any]):
     state.recent_logs.append(entry)
 
 
-def run_server(host: str = "localhost", port: int = 8000, config_path: str = None):
+def run_server(host: str = None, port: int = None, config_path: str = None):
     """Run the API server.
 
     Args:
-        host: Host to bind to
-        port: Port to bind to
+        host: Host to bind to (defaults to config.logging.websocket.host)
+        port: Port to bind to (defaults to config.logging.websocket.port)
         config_path: Path to config file
     """
     config = load_config(config_path) if config_path else load_config()
+
+    # Fall back to websocket config values if not explicitly provided
+    if host is None:
+        host = config.logging.websocket.host
+    if port is None:
+        port = config.logging.websocket.port
+
     app = create_app(config)
 
     uvicorn.run(app, host=host, port=port)

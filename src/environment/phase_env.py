@@ -326,32 +326,68 @@ class PhaseTwoEnv:
         if has_tool_tags:
             format_reward += 0.10
 
-        # Parse tool call
-        tool_pattern = r'<tool>\s*(\w+)\s*\((.*?)\)\s*</tool>'
+        # Parse tool call — use greedy match for content since it contains quotes/newlines
+        tool_pattern = r'<tool>\s*(\w+)\s*\('
         tool_match = re.search(tool_pattern, raw_text, re.DOTALL)
 
         if tool_match:
             tool_name = tool_match.group(1)
-            args_str = tool_match.group(2)
 
             # Check tool name is write_file
             if tool_name == "write_file":
                 format_reward += 0.10
 
-            # Parse arguments
-            arg_pattern = r'(\w+)\s*=\s*(?:"([^"]*?)"|\'([^\']*?)\'|([^,\s\)]+))'
-            parsed_args = {}
-            for m in re.finditer(arg_pattern, args_str, re.DOTALL):
-                key = m.group(1)
-                value = m.group(2) if m.group(2) is not None else (
-                    m.group(3) if m.group(3) is not None else m.group(4)
-                )
-                parsed_args[key] = value
+            # Extract content using a more forgiving approach:
+            # Look for path="..." first, then everything after content=" until </tool>
+            path_match = re.search(r'path\s*=\s*["\']([^"\']+)["\']', raw_text)
+            if path_match:
+                parsed_path = path_match.group(1)
 
-            if 'path' in parsed_args and 'content' in parsed_args:
+            # For content, find content=" or content=' and grab everything until </tool>
+            content_match = re.search(
+                r'content\s*=\s*["\'](.+?)[\'"]\s*\)\s*</tool>',
+                raw_text, re.DOTALL
+            )
+            if not content_match:
+                # Try: content=" ... " ) </tool> with greedy inner match
+                content_match = re.search(
+                    r'content\s*=\s*["\'](.*)["\']',
+                    raw_text, re.DOTALL
+                )
+
+            if content_match:
+                parsed_content = content_match.group(1)
+                # Unescape common escapes
+                parsed_content = parsed_content.replace('\\n', '\n').replace('\\t', '\t')
+
+            if parsed_path and parsed_content:
                 format_reward += 0.10
-                parsed_path = parsed_args['path']
-                parsed_content = parsed_args['content']
+            elif parsed_content:
+                # Got content but no path — still partial credit
+                format_reward += 0.05
+
+        # --- Fallback: if tool tags present but content not parsed, extract code ---
+        if parsed_content is None and has_tool_tags:
+            # Try extracting code between tool tags
+            inner_match = re.search(r'<tool>.*?</tool>', raw_text, re.DOTALL)
+            if inner_match:
+                inner = inner_match.group(0)
+                # Look for Python code patterns inside
+                code_block = re.search(r'```python\s*\n(.*?)```', inner, re.DOTALL)
+                if code_block:
+                    parsed_content = code_block.group(1).strip()
+                else:
+                    # Try to find any def statements
+                    defs = re.findall(r'(def \w+\(.*?\):.*?)(?=def |\Z)', inner, re.DOTALL)
+                    if defs:
+                        parsed_content = '\n'.join(defs)
+
+        # If still no content, try extracting any Python code from raw output
+        if parsed_content is None:
+            code_block = re.search(r'```python\s*\n(.*?)```', raw_text, re.DOTALL)
+            if code_block:
+                parsed_content = code_block.group(1).strip()
+                # No format credit for this fallback, but we can still evaluate code
 
         # --- Code sub-reward (scaled to 0.70) ---
         code_reward = 0.0

@@ -45,7 +45,16 @@ def main():
     args = parser.parse_args()
 
     config = load_config(args.config)
-    
+
+    # Override defaults with config values when the user did not
+    # explicitly provide the argument on the command line.
+    _sentinel_host = "localhost"
+    _sentinel_port = 8000
+    if args.host == _sentinel_host:
+        args.host = getattr(config.ui, "host", _sentinel_host)
+    if args.port == _sentinel_port:
+        args.port = getattr(config.ui, "api_port", _sentinel_port)
+
     print("=" * 60)
     print(f"Starting {config.project.name} Dashboard")
     print("=" * 60)

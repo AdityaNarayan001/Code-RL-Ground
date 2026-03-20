@@ -160,12 +160,29 @@ def setup_logging(
     return logger
 
 
+def configure_from_config(config) -> TrainingLogger:
+    """Configure logging from a Config object.
+
+    Reads ``config.logging.level`` and applies it via :func:`setup_logging`,
+    using ``config.logs_path`` as the log directory.
+
+    Args:
+        config: A :class:`~src.utils.config.Config` instance.
+
+    Returns:
+        Configured root logger.
+    """
+    level = getattr(config.logging, "level", "INFO")
+    log_dir = getattr(config, "logs_path", None)
+    return setup_logging(log_dir=log_dir, level=level)
+
+
 def get_logger(name: str = "code_rl_ground") -> TrainingLogger:
     """Get a logger instance.
-    
+
     Args:
         name: Logger name
-        
+
     Returns:
         Logger instance
     """

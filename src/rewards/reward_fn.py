@@ -276,6 +276,8 @@ class RewardFunction:
         - exact_match weight if content matches exactly
         - tests_pass is 0.0 (no tests in partial mode)
 
+        If ``partial_credit.enabled`` is False, returns 0.0 immediately.
+
         Args:
             actual_content: Actual file content
             expected_content: Expected file content
@@ -283,6 +285,9 @@ class RewardFunction:
         Returns:
             Partial reward (0.0 to 1.0)
         """
+        if not self.reward_config.partial_credit.enabled:
+            return 0.0
+
         score = 0.0
 
         # Syntax check

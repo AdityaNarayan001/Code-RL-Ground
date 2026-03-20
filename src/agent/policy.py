@@ -98,6 +98,14 @@ class LLMPolicy:
     
     def load(self):
         """Load model and tokenizer."""
+        # Validate backend before doing any heavy work
+        backend = self.model_config.backend
+        if backend != "transformers":
+            raise ValueError(
+                f"Unsupported model backend: '{backend}'. "
+                f"Only 'transformers' is currently supported."
+            )
+
         model_name = self.model_config.name
         logger.info(f"Loading model: {model_name}")
         

@@ -197,7 +197,24 @@ class GRPOTrainer:
         logger.info("Starting GRPO training (TinyZero-style)...")
         logger.info(f"Group size: {self.group_size}, Beta: {self.beta}, Clip: {self.clip_range}")
         logger.info(f"PRs to solve: {[t.pr_id for t in self.pr_tasks]}")
-        
+
+        # Apply data augmentation if enabled
+        if self.config.augmentation.enabled:
+            try:
+                from ..data.augmentation import DataAugmenter
+                augmenter = DataAugmenter(seed=self.config.augmentation.seed)
+                original_count = len(self.pr_tasks)
+                self.pr_tasks = augmenter.augment_all(
+                    self.pr_tasks,
+                    strategies=self.config.augmentation.strategies,
+                    multiplier=self.config.augmentation.multiplier,
+                )
+                logger.info(
+                    f"Augmentation enabled: expanded {original_count} tasks to {len(self.pr_tasks)} tasks"
+                )
+            except Exception as aug_err:
+                logger.warning(f"Augmentation enabled but failed to integrate: {aug_err}")
+
         self._broadcast({
             'type': 'info',
             'message': f'Starting GRPO training with {len(self.pr_tasks)} PRs'
@@ -213,17 +230,53 @@ class GRPOTrainer:
                         'message': 'Training stopped by user'
                     })
                     return {'stats': self.stats.to_dict()}
-                
+
                 current_task = self.pr_tasks[self.stats.current_pr_idx]
                 self.stats.current_pr_id = current_task.pr_id
-                
+
                 logger.info(f"Training on PR: {current_task.pr_id}")
                 self._broadcast({
                     'type': 'info',
                     'message': f'Training on {current_task.pr_id} ({self.stats.current_pr_idx + 1}/{len(self.pr_tasks)})'
                 })
-                
-                # Train until solved
+
+                # When curriculum is disabled, run exactly one training step per PR
+                # without solve checking or progression gating
+                if not self.curriculum_config.enabled:
+                    logger.info(f"Curriculum disabled — running single training step for {current_task.pr_id}")
+                    # Global episode budget guard
+                    if self.stats.total_episodes >= self.train_config.max_episodes:
+                        logger.warning(
+                            f"Global episode budget exhausted ({self.train_config.max_episodes}). "
+                            f"Stopping training."
+                        )
+                        return {'stats': self.stats.to_dict()}
+
+                    rollouts = self._collect_rollouts(current_task)
+                    self._compute_advantages(rollouts)
+                    try:
+                        update_stats = self._grpo_update(rollouts)
+                    except RuntimeError as e:
+                        if 'out of memory' in str(e).lower() or 'MPS' in str(e):
+                            logger.error(f"OOM during GRPO update at step {self.stats.total_steps}: {e}")
+                            self.optimizer.zero_grad()
+                            if self.device.type == 'mps':
+                                torch.mps.empty_cache()
+                            elif self.device.type == 'cuda':
+                                torch.cuda.empty_cache()
+                            try:
+                                self._save_checkpoint()
+                            except Exception:
+                                pass
+                            raise
+                        raise
+                    self._log_progress(rollouts, update_stats)
+                    if self.stats.total_steps % self.train_config.checkpointing.save_every_n_steps == 0:
+                        self._save_checkpoint()
+                    self.stats.current_pr_idx += 1
+                    continue
+
+                # Train until solved (curriculum enabled)
                 while not self._is_pr_solved(current_task.pr_id):
                     # Check if stop has been requested
                     if self.stop_requested:
@@ -233,7 +286,7 @@ class GRPOTrainer:
                             'message': 'Training stopped by user'
                         })
                         return {'stats': self.stats.to_dict()}
-                    
+
                     # Global episode budget guard
                     if self.stats.total_episodes >= self.train_config.max_episodes:
                         logger.warning(
@@ -245,7 +298,7 @@ class GRPOTrainer:
                             'message': f'Episode budget exhausted ({self.train_config.max_episodes})'
                         })
                         return {'stats': self.stats.to_dict()}
-                    
+
                     # Per-PR attempt guard (safety valve)
                     pr_attempts = self.stats.attempts_per_pr.get(current_task.pr_id, 0)
                     max_attempts = self.curriculum_config.max_attempts_per_pr
@@ -259,13 +312,13 @@ class GRPOTrainer:
                             'message': f'{current_task.pr_id} skipped after {max_attempts} attempts'
                         })
                         break  # Break inner loop, advance to next PR
-                    
+
                     # Collect rollouts (group of completions)
                     rollouts = self._collect_rollouts(current_task)
-                    
+
                     # Compute group-relative advantages
                     self._compute_advantages(rollouts)
-                    
+
                     # GRPO policy update (with OOM guard)
                     try:
                         update_stats = self._grpo_update(rollouts)
@@ -285,30 +338,30 @@ class GRPOTrainer:
                                 pass
                             raise  # Re-raise so the user sees it
                         raise
-                    
+
                     # Log progress
                     self._log_progress(rollouts, update_stats)
-                    
+
                     # Checkpoint
                     if self.stats.total_steps % self.train_config.checkpointing.save_every_n_steps == 0:
                         self._save_checkpoint()
-                    
+
                     # Periodic mastery evaluation
                     if (self.config.mastery.enabled and
                         self.config.mastery.eval_frequency > 0 and
                         self.stats.total_steps % self.config.mastery.eval_frequency == 0):
                         self._run_mastery_eval()
-                
+
                 # PR solved - advance
                 self._broadcast({
                     'type': 'pr_solved',
                     'pr_id': current_task.pr_id,
                     'attempts': self.stats.total_episodes
                 })
-                
+
                 # Save milestone checkpoint for solved PR
                 self._save_pr_checkpoint(current_task.pr_id)
-                
+
                 self.stats.current_pr_idx += 1
             
             # All PRs solved — run championship round if enabled
@@ -1187,71 +1240,108 @@ Rules:
             logger.info("Restored scheduler state")
     
     def _run_championship(self) -> Dict[str, Any]:
-        """Run championship round: model must solve ALL PRs sequentially from base repo.
-        
-        No retries allowed. This is the final test of mastery.
-        
+        """Run championship round: model must solve ALL PRs from base repo.
+
+        Respects config:
+        - ``mode``: "sequential" means PRs must be solved in order (stop on
+          first failure unless retries are allowed). Any other value runs all
+          PRs independently.
+        - ``allow_retries``: when False each PR gets exactly 1 attempt. When
+          True the PR is retried up to ``max_attempts_per_pr`` times.
+
         Returns:
             Dict with championship results.
         """
         logger.info("\n" + "=" * 60)
-        logger.info("🏆 CHAMPIONSHIP ROUND")
+        logger.info("CHAMPIONSHIP ROUND")
         logger.info("=" * 60)
-        self._broadcast({'type': 'info', 'message': '🏆 Starting championship round...'})
-        
+        self._broadcast({'type': 'info', 'message': 'Starting championship round...'})
+
         results = []
         all_passed = True
         system_prompt = self._get_system_prompt()
         max_turns = self.config.environment.max_turns
         threshold = self.curriculum_config.solve_threshold
-        
+        champ_config = self.config.championship
+        sequential = champ_config.mode == "sequential"
+        allow_retries = champ_config.allow_retries
+        max_retry_attempts = self.curriculum_config.max_attempts_per_pr if allow_retries else 1
+
         for task in self.pr_tasks:
-            self.policy.reset_conversation()
-            obs = self.env.reset(task.data, task.depends_on)
-            
-            conversation_history = []
-            turn = 0
-            terminal = False
-            
-            while not terminal and turn < max_turns:
-                turn += 1
-                prompt = self._build_turn_prompt(task, obs, conversation_history, system_prompt)
-                output = self.policy.generate(
-                    prompt,
-                    system_prompt=system_prompt if turn == 1 else None,
-                    return_log_probs=False,
-                    temperature=0.0  # Greedy for championship
-                )
-                
-                action = self.env.parse_action(output.text)
-                obs = self.env.step(action)
-                terminal = obs.is_terminal
-                
-                conversation_history.append({'role': 'assistant', 'content': output.text})
-                if not terminal:
-                    conversation_history.append({'role': 'user', 'content': obs.content})
-            
-            episode = self.env.get_episode()
-            reward = episode.total_reward if episode else 0.0
-            passed = reward >= threshold
-            
+            passed = False
+            best_reward = 0.0
+            best_turns = 0
+
+            for attempt in range(max_retry_attempts):
+                self.policy.reset_conversation()
+                obs = self.env.reset(task.data, task.depends_on)
+
+                conversation_history = []
+                turn = 0
+                terminal = False
+
+                while not terminal and turn < max_turns:
+                    turn += 1
+                    prompt = self._build_turn_prompt(task, obs, conversation_history, system_prompt)
+                    output = self.policy.generate(
+                        prompt,
+                        system_prompt=system_prompt if turn == 1 else None,
+                        return_log_probs=False,
+                        temperature=0.0  # Greedy for championship
+                    )
+
+                    action = self.env.parse_action(output.text)
+                    obs = self.env.step(action)
+                    terminal = obs.is_terminal
+
+                    conversation_history.append({'role': 'assistant', 'content': output.text})
+                    if not terminal:
+                        conversation_history.append({'role': 'user', 'content': obs.content})
+
+                episode = self.env.get_episode()
+                reward = episode.total_reward if episode else 0.0
+
+                if reward > best_reward:
+                    best_reward = reward
+                    best_turns = turn
+
+                if reward >= threshold:
+                    passed = True
+                    best_reward = reward
+                    best_turns = turn
+                    break  # No need to retry
+
             if not passed:
                 all_passed = False
-            
+
             results.append({
                 'pr_id': task.pr_id,
-                'reward': reward,
+                'reward': best_reward,
                 'passed': passed,
-                'turns': turn,
+                'turns': best_turns,
             })
-            
-            status = '✅' if passed else '❌'
-            logger.info(f"  {status} {task.pr_id}: reward={reward:.3f} ({turn} turns)")
+
+            status = 'PASS' if passed else 'FAIL'
+            logger.info(f"  {status} {task.pr_id}: reward={best_reward:.3f} ({best_turns} turns)")
             self._broadcast({
                 'type': 'championship_pr',
-                'pr_id': task.pr_id, 'reward': reward,
-                'passed': passed, 'turns': turn,
+                'pr_id': task.pr_id, 'reward': best_reward,
+                'passed': passed, 'turns': best_turns,
             })
+
+            # In sequential mode, stop on first failure (no point continuing)
+            if sequential and not passed:
+                logger.info(f"Sequential championship: stopping after {task.pr_id} failed")
+                # Mark remaining PRs as not attempted
+                remaining_idx = self.pr_tasks.index(task) + 1
+                for remaining_task in self.pr_tasks[remaining_idx:]:
+                    results.append({
+                        'pr_id': remaining_task.pr_id,
+                        'reward': 0.0,
+                        'passed': False,
+                        'turns': 0,
+                    })
+                break
         
         championship_result = {
             'passed': all_passed,
@@ -1297,12 +1387,20 @@ Rules:
         logger.info(f"Running mastery evaluation at step {self.stats.total_steps}...")
         self._broadcast({'type': 'info', 'message': f'Mastery eval at step {self.stats.total_steps}'})
         
+        # Determine which PRs to evaluate
+        if test_config.require_all_prs:
+            # All solved PRs must pass mastery
+            prs_to_eval = [t for t in self.pr_tasks if t.pr_id in self.stats.solved_prs]
+        else:
+            # Only check the most recently solved PR (subset mode)
+            prs_to_eval = []
+            for t in reversed(self.pr_tasks):
+                if t.pr_id in self.stats.solved_prs:
+                    prs_to_eval = [t]
+                    break
+
         results = {}
-        for task in self.pr_tasks:
-            # Only evaluate solved PRs (no point testing unsolved ones)
-            if task.pr_id not in self.stats.solved_prs:
-                continue
-            
+        for task in prs_to_eval:
             successes = 0
             for attempt in range(test_config.num_attempts_per_pr):
                 self.policy.reset_conversation()
@@ -1310,7 +1408,7 @@ Rules:
                 conversation_history = []
                 turn = 0
                 terminal = False
-                
+
                 while not terminal and turn < max_turns:
                     turn += 1
                     prompt = self._build_turn_prompt(task, obs, conversation_history, system_prompt)
@@ -1326,25 +1424,32 @@ Rules:
                     conversation_history.append({'role': 'assistant', 'content': output.text})
                     if not terminal:
                         conversation_history.append({'role': 'user', 'content': obs.content})
-                
+
                 episode = self.env.get_episode()
                 reward = episode.total_reward if episode else 0.0
                 self.env.cleanup()
-                
+
                 if reward >= threshold:
                     successes += 1
-            
+
             results[task.pr_id] = {
                 'successes': successes,
                 'attempts': test_config.num_attempts_per_pr,
                 'pass_rate': successes / test_config.num_attempts_per_pr,
                 'mastered': successes == test_config.num_attempts_per_pr,
             }
-            
-            status = '✅' if results[task.pr_id]['mastered'] else '⚠️'
+
+            status = 'PASS' if results[task.pr_id]['mastered'] else 'WARN'
             logger.info(f"  {status} {task.pr_id}: {successes}/{test_config.num_attempts_per_pr}")
-        
-        all_mastered = all(r['mastered'] for r in results.values()) if results else False
+
+        # Check overall mastery against the configured threshold
+        if results:
+            mastered_count = sum(1 for r in results.values() if r['mastered'])
+            total_evaluated = len(results)
+            mastery_fraction = mastered_count / total_evaluated
+            all_mastered = mastery_fraction >= test_config.overall_success_threshold
+        else:
+            all_mastered = False
         
         self._broadcast({
             'type': 'mastery_eval',
