@@ -55,18 +55,22 @@ class Tool:
 
 class ToolRegistry:
     """Registry of available tools for the agent."""
-    
-    def __init__(self, working_dir: Optional[Path] = None):
+
+    def __init__(self, working_dir: Optional[Path] = None, available_tools: Optional[List[str]] = None):
         """Initialize tool registry.
-        
+
         Args:
             working_dir: Working directory for file operations
+            available_tools: Whitelist of tool names to register.  If ``None``
+                all default tools are registered.  Comes from
+                ``config.environment.tools.available``.
         """
         self.working_dir = working_dir
         self.tools: Dict[str, Tool] = {}
         self._file_cache: Dict[str, str] = {}
         self._modifications: Dict[str, str] = {}
-        
+        self._available_tools: Optional[List[str]] = available_tools
+
         # Register default tools
         self._register_default_tools()
     
@@ -153,7 +157,14 @@ class ToolRegistry:
         ))
     
     def register(self, tool: Tool):
-        """Register a tool."""
+        """Register a tool.
+
+        If an ``available_tools`` whitelist was provided at init time, tools
+        whose name is not in the list are silently skipped.
+        """
+        if self._available_tools is not None and tool.name not in self._available_tools:
+            logger.debug("Skipping tool '%s' (not in available_tools whitelist)", tool.name)
+            return
         self.tools[tool.name] = tool
     
     def get(self, name: str) -> Optional[Tool]:

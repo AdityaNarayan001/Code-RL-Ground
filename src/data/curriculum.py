@@ -159,13 +159,24 @@ class CurriculumManager:
     
     def get_current_task(self) -> Optional[PRTask]:
         """Get the current task to work on.
-        
+
+        When ``strict_progression`` is False the model may attempt any
+        unsolved PR, so we return the first unsolved PR in the order
+        rather than gating on ``_current_idx``.
+
         Returns:
             Current PRTask or None if all done
         """
+        if not self.curriculum_config.strict_progression:
+            # Non-strict: return the first unsolved PR in the order
+            for pr_id in self._order:
+                if not self.progress[pr_id].solved:
+                    return self.task_map[pr_id]
+            return None  # all solved
+
         if self._current_idx >= len(self._order):
             return None
-        
+
         pr_id = self._order[self._current_idx]
         return self.task_map[pr_id]
     
@@ -231,14 +242,25 @@ class CurriculumManager:
     
     def advance(self) -> Optional[PRTask]:
         """Advance to next PR.
-        
+
+        When ``strict_progression`` is False the index is not used for
+        gating so we just mark the current PR solved and return the
+        next unsolved PR via ``get_current_task()``.
+
         Returns:
             Next PRTask or None if all done
         """
+        if not self.curriculum_config.strict_progression:
+            # Non-strict: mark current PR solved, return next unsolved
+            current = self.get_current_task()
+            if current:
+                self.progress[current.pr_id].solved = True
+            return self.get_current_task()
+
         if self._current_idx < len(self._order):
             current_pr = self._order[self._current_idx]
             self.progress[current_pr].solved = True
-        
+
         self._current_idx += 1
         return self.get_current_task()
     

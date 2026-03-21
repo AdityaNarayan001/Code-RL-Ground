@@ -166,17 +166,25 @@ class RewardFunction:
         for filepath, content in files.items():
             if not filepath.endswith('.py'):
                 continue
+            # Skip files that aren't pure source modules
+            basename = Path(filepath).name
+            if basename in ('setup.py', '__main__.py', '__init__.py'):
+                continue
+            # Skip test files (they import the package which isn't available in exec context)
+            if basename.startswith('test_') or '/tests/' in filepath or filepath.startswith('tests/'):
+                continue
             try:
-                # Compile and exec in an isolated module to catch ImportError
                 code = compile(content, filepath, 'exec')
-                module = types.ModuleType(f'_import_check_{filepath}')
+                # Use a clean module name (no slashes)
+                mod_name = f'_import_check_{basename}'
+                module = types.ModuleType(mod_name)
                 module.__file__ = filepath
-                # We only check for ImportError, not execution errors
                 exec(code, module.__dict__)
             except ImportError:
                 return False
+            except (SystemExit, KeyboardInterrupt):
+                pass
             except Exception:
-                # Other errors (NameError, etc.) are not import issues
                 pass
         return True
 
@@ -268,6 +276,8 @@ class RewardFunction:
         - exact_match weight if content matches exactly
         - tests_pass is 0.0 (no tests in partial mode)
 
+        If ``partial_credit.enabled`` is False, returns 0.0 immediately.
+
         Args:
             actual_content: Actual file content
             expected_content: Expected file content
@@ -275,6 +285,9 @@ class RewardFunction:
         Returns:
             Partial reward (0.0 to 1.0)
         """
+        if not self.reward_config.partial_credit.enabled:
+            return 0.0
+
         score = 0.0
 
         # Syntax check

@@ -1,12 +1,45 @@
-import { useEffect, useRef, useState } from 'react'
-import { WSMessage } from '../types'
+import { useEffect, useRef, useState, useMemo } from 'react'
+import { WSMessage, PhaseInfo } from '../types'
 
 interface LiveGenerationProps {
   text: string
   logs: WSMessage[]
+  phaseInfo?: PhaseInfo | null
 }
 
-function LiveGeneration({ text, logs }: LiveGenerationProps) {
+function HighlightedToolText({ text }: { text: string }) {
+  const parts = useMemo(() => {
+    const result: { text: string; isToolTag: boolean }[] = []
+    const regex = /<tool>([\s\S]*?)<\/tool>/g
+    let lastIndex = 0
+    let match
+    while ((match = regex.exec(text)) !== null) {
+      if (match.index > lastIndex) {
+        result.push({ text: text.slice(lastIndex, match.index), isToolTag: false })
+      }
+      result.push({ text: match[0], isToolTag: true })
+      lastIndex = regex.lastIndex
+    }
+    if (lastIndex < text.length) {
+      result.push({ text: text.slice(lastIndex), isToolTag: false })
+    }
+    return result
+  }, [text])
+
+  return (
+    <span>
+      {parts.map((part, i) =>
+        part.isToolTag ? (
+          <span key={i} className="bg-yellow-900/40 text-yellow-300 border border-yellow-700/50 rounded px-0.5">{part.text}</span>
+        ) : (
+          <span key={i} className="text-gray-300">{part.text}</span>
+        )
+      )}
+    </span>
+  )
+}
+
+function LiveGeneration({ text, logs, phaseInfo }: LiveGenerationProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const [lastComplete, setLastComplete] = useState<WSMessage | null>(null)
   const [lastToken, setLastToken] = useState<WSMessage | null>(null)
@@ -67,7 +100,14 @@ function LiveGeneration({ text, logs }: LiveGenerationProps) {
   return (
     <div className="h-full flex flex-col">
       <div className="p-4 border-b border-gray-700">
-        <h2 className="text-lg font-semibold text-white">Model Generation</h2>
+        <h2 className="text-lg font-semibold text-white">
+          Model Generation
+          {phaseInfo && phaseInfo.current_phase > 0 && (
+            <span className="ml-2 text-sm font-normal text-gray-400">
+              &mdash; Phase {phaseInfo.current_phase}: {phaseInfo.phase_name}
+            </span>
+          )}
+        </h2>
         <div className="flex items-center gap-3 mt-1 flex-wrap">
           {currentPR && (
             <span className="px-2 py-0.5 bg-blue-600 rounded text-xs font-medium">
@@ -128,7 +168,15 @@ function LiveGeneration({ text, logs }: LiveGenerationProps) {
 
         {displayText ? (
           <div className="bg-gray-800 rounded-lg p-4 whitespace-pre-wrap border border-gray-700">
-            <span className="text-gray-300">{displayText}</span>
+            {phaseInfo?.current_phase === 1 ? (
+              // Phase 1: No tools, show raw code output
+              <code className="text-green-300 text-sm">{displayText}</code>
+            ) : phaseInfo?.current_phase === 2 ? (
+              // Phase 2: Highlight <tool>...</tool> tags
+              <HighlightedToolText text={displayText} />
+            ) : (
+              <span className="text-gray-300">{displayText}</span>
+            )}
             {isStreaming && <span className="cursor-blink" />}
           </div>
         ) : (

@@ -357,8 +357,11 @@ def load_config(config_path: Optional[str] = None) -> Config:
     if 'ui' in data:
         config.ui = _dict_to_dataclass(UIConfig, data['ui'])
     
+    # Store raw config for dynamic access (e.g., phased_training)
+    config._raw_config = data
+
     # Create necessary directories
     for dir_path in [config.cache_path, config.checkpoints_path, config.logs_path]:
         dir_path.mkdir(parents=True, exist_ok=True)
-    
+
     return config

@@ -172,3 +172,56 @@ ui:
   port: 3000
   api_port: 8000
   refresh_rate_ms: 500
+
+# Phased Training Configuration
+phased_training:
+  enabled: true
+  start_phase: 1
+  max_steps_per_phase: 500
+  phases:
+    1:
+      name: "Code Completion"
+      max_turns: 1
+      group_size: 4
+      tools: []
+      advancement_threshold: 0.8
+      advancement_window: 10
+      advancement_required: 7
+      pr_ids: ["PR-001", "PR-003"]
+    2:
+      name: "Tool Format"
+      max_turns: 1
+      group_size: 4
+      tools: ["write_file"]
+      advancement_threshold: 0.50
+      advancement_window: 10
+      advancement_required: 5
+      pr_ids: ["PR-001", "PR-003"]
+    3:
+      name: "Read+Write"
+      max_turns: 2
+      group_size: 4
+      tools: ["read_file", "write_file"]
+      auto_submit_after_turn: 2
+      advancement_threshold: 0.7
+      advancement_window: 12
+      advancement_required: 8
+      pr_ids: ["PR-001", "PR-003", "PR-005", "PR-006"]
+    4:
+      name: "Tool Chain"
+      max_turns: 5
+      group_size: 4
+      tools: ["read_file", "write_file", "edit_file", "list_directory", "submit"]
+      advancement_threshold: 0.7
+      advancement_window: 15
+      advancement_required: 10
+      pr_ids: ["PR-001", "PR-002", "PR-003", "PR-004", "PR-005", "PR-006", "PR-007", "PR-008"]
+    5:
+      name: "Full Curriculum"
+      max_turns: 10
+      group_size: 4
+      tools: ["read_file", "write_file", "edit_file", "list_directory", "run_python", "search_code", "submit"]
+      advancement_threshold: 0.9
+      advancement_window: 20
+      advancement_required: 16
+      pr_ids: "all"

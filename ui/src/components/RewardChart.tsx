@@ -1,12 +1,15 @@
+import { useMemo } from 'react'
 import { Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Area, AreaChart, ReferenceLine } from 'recharts'
-import { EpisodeMetric } from '../types'
+import { EpisodeMetric, PhaseInfo, WSMessage } from '../types'
 
 interface RewardChartProps {
   data: EpisodeMetric[]
   currentStep?: number
+  phaseInfo?: PhaseInfo | null
+  logs?: WSMessage[]
 }
 
-function RewardChart({ data, currentStep: _currentStep }: RewardChartProps) {
+function RewardChart({ data, currentStep: _currentStep, phaseInfo: _phaseInfo, logs }: RewardChartProps) {
   // Calculate moving average
   const windowSize = 10
   const chartData = data.map((point, i) => {
@@ -21,6 +24,23 @@ function RewardChart({ data, currentStep: _currentStep }: RewardChartProps) {
       solved: point.solved ? 1 : 0,
     }
   })
+
+  // Detect phase transition episodes from logs
+  const phaseTransitions = useMemo(() => {
+    if (!logs) return []
+    const transitions: { episode: number; phase: number; phaseName: string }[] = []
+    for (const log of logs) {
+      if (log.type === 'phase_change') {
+        const ep = log.episode ?? log.at_episode ?? 0
+        transitions.push({
+          episode: ep,
+          phase: log.new_phase ?? log.current_phase ?? 0,
+          phaseName: log.phase_name ?? log.new_phase_name ?? '',
+        })
+      }
+    }
+    return transitions
+  }, [logs])
 
   if (chartData.length === 0) {
     return (
@@ -71,7 +91,30 @@ function RewardChart({ data, currentStep: _currentStep }: RewardChartProps) {
           }}
           labelStyle={{ color: '#9ca3af' }}
           formatter={(value: number) => value.toFixed(3)}
+          labelFormatter={(label: number) => {
+            const transition = phaseTransitions.find(t => t.episode === label)
+            if (transition) {
+              return `Episode ${label} (Phase ${transition.phase}: ${transition.phaseName})`
+            }
+            return `Episode ${label}`
+          }}
         />
+        {/* Phase transition lines */}
+        {phaseTransitions.map((t, i) => (
+          <ReferenceLine
+            key={`phase-${i}`}
+            x={t.episode}
+            stroke="#a855f7"
+            strokeWidth={1.5}
+            strokeDasharray="6 3"
+            label={{
+              value: `P${t.phase}`,
+              position: 'top',
+              fill: '#a855f7',
+              fontSize: 10,
+            }}
+          />
+        ))}
         {/* Current episode indicator */}
         {currentEpisode > 0 && (
           <ReferenceLine
