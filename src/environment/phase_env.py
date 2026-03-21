@@ -212,12 +212,19 @@ class PhaseOneEnv:
 
 
 class PhaseTwoEnv:
-    """Phase 2: Tool format learning. Model wraps code in tool calls.
+    """Phase 2: Structured output learning.
 
-    Single turn. The model must output:
-        <tool>write_file(path="...", content="...")</tool>
+    Single turn. The model must output code wrapped in structured tags:
 
-    Reward is split: 0.3 for correct format, 0.7 for code quality.
+        <file path="pyutils/strings.py">
+        ...complete file content...
+        </file>
+
+    This format is trivially parseable (no quote-escaping issues) and teaches
+    the model to associate code with file paths using XML-style markup —
+    a stepping stone toward full <tool>...</tool> syntax in Phase 3+.
+
+    Reward: 0.3 for correct format, 0.7 for code quality.
     """
 
     def __init__(self, config: Config, repo_manager: Optional[RepoStateManager] = None):
@@ -243,27 +250,15 @@ class PhaseTwoEnv:
         return self._reward_fn
 
     def reset(self, pr_data: Dict[str, Any], dependency_prs: List[str]) -> Observation:
-        """Reset environment for a new episode.
-
-        Args:
-            pr_data: PR task definition
-            dependency_prs: List of dependency PRs (already solved)
-
-        Returns:
-            Initial observation with file content and tool format instructions
-        """
+        """Reset for new episode."""
         pr_id = pr_data['pr_id']
         self.current_pr_data = pr_data
 
-        # Get repository state with dependencies applied
         self.current_state = self.repo_manager.get_state_for_pr(pr_id, dependency_prs)
-
-        # Create working directory (resolve to absolute path)
         self.working_dir = self.repo_manager.create_working_directory(self.current_state)
         if not self.working_dir.is_absolute():
             self.working_dir = self.working_dir.resolve()
 
-        # Read file content for files in pr_data['files_changed']
         files_changed = pr_data.get('files_changed', [])
         file_contents = []
         for file_path in files_changed:
@@ -271,49 +266,40 @@ class PhaseTwoEnv:
             if content is not None:
                 file_contents.append(f"### File: {file_path}\n```python\n{content}\n```")
             else:
-                file_contents.append(f"### File: {file_path}\n(new file - does not exist yet)")
+                file_contents.append(f"### File: {file_path}\n(new file)")
 
-        # Build prompt with tool format instructions
+        # Example using the actual target file
+        example_path = files_changed[0] if files_changed else "example.py"
+
         prompt_parts = [
             f"# Task: {pr_data['title']}",
             "",
-            f"## Description",
+            "## Description",
             pr_data['description'],
             "",
             "## Current File Content",
             "\n\n".join(file_contents),
             "",
-            "Write the updated file using the following tool format:",
-            '<tool>write_file(path="<filepath>", content="<full file content>")</tool>',
+            "## Output Format",
+            "Wrap the complete updated file in <file> tags with the path attribute:",
             "",
-            "You MUST wrap your output in <tool>...</tool> tags using the write_file tool.",
+            f'<file path="{example_path}">',
+            "...complete updated file content here...",
+            "</file>",
+            "",
+            "Output ONLY the <file> block. No explanations.",
         ]
         prompt = "\n".join(prompt_parts)
 
-        # Initialize episode
-        self.current_episode = Episode(
-            pr_id=pr_id,
-            task_description=prompt,
-        )
+        self.current_episode = Episode(pr_id=pr_id, task_description=prompt)
 
         return Observation(
             content=prompt,
-            info={
-                'pr_id': pr_id,
-                'turn': 0,
-                'files': files_changed,
-            }
+            info={'pr_id': pr_id, 'turn': 0, 'files': files_changed}
         )
 
     def step(self, action: Action) -> Observation:
-        """Process model output, scoring format and code quality.
-
-        Args:
-            action: Action with model output
-
-        Returns:
-            Terminal Observation with reward (format_reward + code_reward)
-        """
+        """Score format adherence and code quality."""
         raw_text = action.text or action.raw_output or ""
 
         # --- Format sub-reward (0.30 total) ---
@@ -321,101 +307,62 @@ class PhaseTwoEnv:
         parsed_path = None
         parsed_content = None
 
-        # Check for <tool>...</tool> tags
-        has_tool_tags = bool(re.search(r'<tool>.*?</tool>', raw_text, re.DOTALL))
-        if has_tool_tags:
+        # 1. Check for <file ...>...</file> tags (0.10)
+        has_file_tags = bool(re.search(r'<file[\s>].*?</file>', raw_text, re.DOTALL))
+        if has_file_tags:
             format_reward += 0.10
 
-        # Parse tool call — use greedy match for content since it contains quotes/newlines
-        tool_pattern = r'<tool>\s*(\w+)\s*\('
-        tool_match = re.search(tool_pattern, raw_text, re.DOTALL)
+        # 2. Extract path attribute (0.10)
+        path_match = re.search(r'<file\s+path\s*=\s*["\']([^"\']+)["\']', raw_text)
+        if path_match:
+            parsed_path = path_match.group(1)
+            format_reward += 0.10
 
-        if tool_match:
-            tool_name = tool_match.group(1)
+        # 3. Extract content between tags (0.10)
+        content_match = re.search(
+            r'<file[^>]*>\s*\n?(.*?)\s*</file>',
+            raw_text, re.DOTALL
+        )
+        if content_match:
+            parsed_content = content_match.group(1)
+            format_reward += 0.10
 
-            # Check tool name is write_file
-            if tool_name == "write_file":
-                format_reward += 0.10
-
-            # Extract content using a more forgiving approach:
-            # Look for path="..." first, then everything after content=" until </tool>
-            path_match = re.search(r'path\s*=\s*["\']([^"\']+)["\']', raw_text)
-            if path_match:
-                parsed_path = path_match.group(1)
-
-            # For content, find content=" or content=' and grab everything until </tool>
-            content_match = re.search(
-                r'content\s*=\s*["\'](.+?)[\'"]\s*\)\s*</tool>',
-                raw_text, re.DOTALL
-            )
-            if not content_match:
-                # Try: content=" ... " ) </tool> with greedy inner match
-                content_match = re.search(
-                    r'content\s*=\s*["\'](.*)["\']',
-                    raw_text, re.DOTALL
-                )
-
-            if content_match:
-                parsed_content = content_match.group(1)
-                # Unescape common escapes
-                parsed_content = parsed_content.replace('\\n', '\n').replace('\\t', '\t')
-
-            if parsed_path and parsed_content:
-                format_reward += 0.10
-            elif parsed_content:
-                # Got content but no path — still partial credit
-                format_reward += 0.05
-
-        # --- Fallback: if tool tags present but content not parsed, extract code ---
-        if parsed_content is None and has_tool_tags:
-            # Try extracting code between tool tags
-            inner_match = re.search(r'<tool>.*?</tool>', raw_text, re.DOTALL)
-            if inner_match:
-                inner = inner_match.group(0)
-                # Look for Python code patterns inside
-                code_block = re.search(r'```python\s*\n(.*?)```', inner, re.DOTALL)
-                if code_block:
-                    parsed_content = code_block.group(1).strip()
-                else:
-                    # Try to find any def statements
-                    defs = re.findall(r'(def \w+\(.*?\):.*?)(?=def |\Z)', inner, re.DOTALL)
-                    if defs:
-                        parsed_content = '\n'.join(defs)
-
-        # If still no content, try extracting any Python code from raw output
+        # --- Fallback extraction ---
         if parsed_content is None:
+            # Try markdown fences
             code_block = re.search(r'```python\s*\n(.*?)```', raw_text, re.DOTALL)
             if code_block:
                 parsed_content = code_block.group(1).strip()
-                # No format credit for this fallback, but we can still evaluate code
+            else:
+                # Try raw code (if it looks like Python with def/class/import)
+                stripped = raw_text.strip()
+                if re.match(r'^(?:"""|\#|def |class |import |from )', stripped):
+                    parsed_content = stripped
 
         # --- Code sub-reward (scaled to 0.70) ---
         code_reward = 0.0
 
         if parsed_content is not None:
-            # Determine target file
+            # Strip markdown fences if present inside
+            parsed_content = PhaseOneEnv._strip_markdown_fences(parsed_content)
+
             files_changed = self.current_pr_data.get('files_changed', [])
             target_file = parsed_path or (files_changed[0] if files_changed else None)
 
             if target_file:
-                # Write content to working directory
                 full_path = self.working_dir / target_file
                 full_path.parent.mkdir(parents=True, exist_ok=True)
                 full_path.write_text(parsed_content)
 
-                # Get actual state
                 actual_state = self.repo_manager.state_from_directory(
                     self.working_dir,
                     self.current_state.applied_prs + [self.current_pr_data['pr_id']]
                 )
-
-                # Get expected state
                 expected_state = self.repo_manager.get_expected_state_after_pr(
                     self.current_pr_data['pr_id'],
                     self.current_state.applied_prs
                 )
 
-                # Compute code reward and scale to 0.7
                 reward_result = self.reward_fn.compute(
                     actual_state=actual_state,
                     expected_state=expected_state,
@@ -426,7 +373,6 @@ class PhaseTwoEnv:
 
         total_reward = format_reward + code_reward
 
-        # Update episode
         if self.current_episode:
             self.current_episode.total_reward = total_reward
             self.current_episode.solved = total_reward >= self.config.curriculum.solve_threshold
@@ -440,8 +386,9 @@ class PhaseTwoEnv:
                 'turn': 1,
                 'format_reward': format_reward,
                 'code_reward': code_reward,
-                'has_tool_tags': has_tool_tags,
-                'parsed_successfully': parsed_content is not None,
+                'has_file_tags': has_file_tags,
+                'parsed_path': parsed_path,
+                'parsed_content_length': len(parsed_content) if parsed_content else 0,
                 'solved': self.current_episode.solved if self.current_episode else False,
             }
         )
@@ -452,7 +399,7 @@ class PhaseTwoEnv:
         return obs
 
     def parse_action(self, text: str) -> Action:
-        """Parse model output — check for tool format."""
+        """Parse model output."""
         return Action(action_type=ActionType.SUBMIT, raw_output=text, text=text)
 
     def get_episode(self) -> Optional[Episode]:

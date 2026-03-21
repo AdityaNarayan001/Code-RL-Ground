@@ -1020,10 +1020,13 @@ class GRPOTrainer:
         if isinstance(self.env, PhaseOneEnv):
             return "You are a Python developer. Output ONLY valid Python code. No explanations, no markdown fences, no tool calls."
         if isinstance(self.env, PhaseTwoEnv):
-            return """You are a code assistant. Write files using this EXACT format:
-<tool>write_file(path="filename.py", content="...file content...")</tool>
+            return """You are a code assistant. Write updated files using this EXACT format:
 
-Output ONLY the tool call. Nothing else."""
+<file path="filename.py">
+...complete file content...
+</file>
+
+Output ONLY the <file> block. No explanations, no markdown."""
 
         return """You are a code assistant. You solve tasks by calling tools.
 
