@@ -119,8 +119,10 @@ class CodeEnv:
         # Get repository state with dependencies applied
         self.current_state = self.repo_manager.get_state_for_pr(pr_id, dependency_prs)
         
-        # Create working directory
+        # Create working directory (resolve to absolute for subprocess compatibility)
         self.working_dir = self.repo_manager.create_working_directory(self.current_state)
+        if not self.working_dir.is_absolute():
+            self.working_dir = self.working_dir.resolve()
         
         # Configure tools with working directory
         self.tools.set_working_dir(self.working_dir)
