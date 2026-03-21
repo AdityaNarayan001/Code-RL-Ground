@@ -184,7 +184,7 @@ phased_training:
       max_turns: 1
       group_size: 4
       tools: []
-      advancement_threshold: 0.8
+      advancement_threshold: 0.79
       advancement_window: 10
       advancement_required: 7
       pr_ids: ["PR-001", "PR-003"]

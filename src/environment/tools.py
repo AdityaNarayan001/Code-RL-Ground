@@ -474,20 +474,30 @@ class ToolRegistry:
         Returns:
             Dictionary with tool name and arguments, or None
         """
-        # Match <tool>name(args)</tool> pattern
-        pattern = r'<tool>(\w+)\((.*?)\)</tool>'
-        match = re.search(pattern, text, re.DOTALL)
+        # Match <tool>...</tool> — grab everything inside, then parse tool name + args
+        outer_match = re.search(r'<tool>(.*?)</tool>', text, re.DOTALL)
 
-        if not match:
+        if not outer_match:
             # Try alternate patterns
-            pattern2 = r'```tool\n(\w+)\((.*?)\)\n```'
-            match = re.search(pattern2, text, re.DOTALL)
+            outer_match = re.search(r'```tool\n(.*?)\n```', text, re.DOTALL)
 
-        if not match:
+        if not outer_match:
             return None
 
-        tool_name = match.group(1)
-        args_str = match.group(2).strip()
+        inner = outer_match.group(1).strip()
+
+        # Extract tool name: first word followed by (
+        name_match = re.match(r'(\w+)\s*\(', inner)
+        if not name_match:
+            return None
+
+        tool_name = name_match.group(1)
+        # Args is everything after "name(" up to the last ")"
+        rest = inner[name_match.end():]
+        # Strip trailing ) if present (the outermost closing paren)
+        if rest.rstrip().endswith(')'):
+            rest = rest.rstrip()[:-1]
+        args_str = rest.strip()
 
         # Parse arguments
         args = {}
