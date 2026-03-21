@@ -467,48 +467,101 @@ class ToolRegistry:
     
     def parse_tool_call(self, text: str) -> Optional[Dict[str, Any]]:
         """Parse a tool call from model output.
-        
+
         Args:
             text: Model output text
-            
+
         Returns:
             Dictionary with tool name and arguments, or None
         """
         # Match <tool>name(args)</tool> pattern
         pattern = r'<tool>(\w+)\((.*?)\)</tool>'
         match = re.search(pattern, text, re.DOTALL)
-        
+
         if not match:
             # Try alternate patterns
             pattern2 = r'```tool\n(\w+)\((.*?)\)\n```'
             match = re.search(pattern2, text, re.DOTALL)
-        
+
         if not match:
             return None
-        
+
         tool_name = match.group(1)
         args_str = match.group(2).strip()
-        
+
         # Parse arguments
         args = {}
         if args_str:
-            # Handle key=value pairs
-            # This is a simple parser - could be made more robust
             try:
-                # Try to parse as Python dict-like syntax
-                # Handle both key="value" and key=value
-                arg_pattern = r'(\w+)\s*=\s*(?:"([^"]*?)"|\'([^\']*?)\'|([^,\s\)]+))'
-                for m in re.finditer(arg_pattern, args_str):
-                    key = m.group(1)
-                    value = m.group(2) or m.group(3) or m.group(4)
-                    # Type coercion for unquoted values
-                    if m.group(4) is not None:
-                        try:
-                            value = json.loads(value)
-                        except (json.JSONDecodeError, ValueError):
-                            pass
-                    args[key] = value
+                # For write_file/edit_file: content arg contains code with quotes/newlines
+                # Use a specialized extraction for 'content' argument
+                if tool_name in ('write_file', 'edit_file'):
+                    args = self._parse_content_args(args_str, tool_name)
+                else:
+                    # Standard key=value parsing for simple tools
+                    arg_pattern = r'(\w+)\s*=\s*(?:"([^"]*?)"|\'([^\']*?)\'|([^,\s\)]+))'
+                    for m in re.finditer(arg_pattern, args_str):
+                        key = m.group(1)
+                        value = m.group(2) or m.group(3) or m.group(4)
+                        if m.group(4) is not None:
+                            try:
+                                value = json.loads(value)
+                            except (json.JSONDecodeError, ValueError):
+                                pass
+                        args[key] = value
             except (re.error, AttributeError) as e:
                 logger.warning(f"Failed to parse tool arguments '{args_str}': {e}")
-        
+
         return {"tool": tool_name, "args": args}
+
+    @staticmethod
+    def _parse_content_args(args_str: str, tool_name: str) -> Dict[str, str]:
+        """Parse arguments for write_file/edit_file where content has quotes/newlines.
+
+        Strategy: extract path first (simple), then treat everything after
+        content= as the content value (greedy, handles embedded quotes).
+        """
+        args = {}
+
+        # Extract path="..." (simple, no embedded quotes)
+        path_match = re.search(r'path\s*=\s*["\']([^"\']+)["\']', args_str)
+        if path_match:
+            args['path'] = path_match.group(1)
+
+        if tool_name == 'write_file':
+            # For write_file: content is everything after content=" until the end
+            content_match = re.search(r'content\s*=\s*["\']', args_str)
+            if content_match:
+                # Start position after the opening quote
+                start = content_match.end()
+                # Content is everything from here to the end of args_str
+                # (the outer regex already stripped the closing )</tool>)
+                content = args_str[start:]
+                # Strip trailing quote if present
+                if content.endswith('"') or content.endswith("'"):
+                    content = content[:-1]
+                # Unescape common sequences
+                content = content.replace('\\n', '\n').replace('\\t', '\t').replace('\\"', '"').replace("\\'", "'")
+                args['content'] = content
+
+        elif tool_name == 'edit_file':
+            # For edit_file: old_content and new_content
+            # Try to find old_content="..." and new_content="..."
+            # These are harder — use the simple regex for now and fall back
+            for key in ('old_content', 'new_content', 'content'):
+                pattern = key + r'\s*=\s*["\']'
+                km = re.search(pattern, args_str)
+                if km:
+                    start = km.end()
+                    # Find the next key= or end of string
+                    next_key = re.search(r',\s*(?:old_content|new_content|path)\s*=', args_str[start:])
+                    if next_key:
+                        val = args_str[start:start + next_key.start()]
+                    else:
+                        val = args_str[start:]
+                    if val.endswith('"') or val.endswith("'"):
+                        val = val[:-1]
+                    val = val.replace('\\n', '\n').replace('\\t', '\t').replace('\\"', '"')
+                    args[key] = val
+
+        return args

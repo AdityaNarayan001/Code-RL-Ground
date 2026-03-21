@@ -167,15 +167,20 @@ class ExperimentLogger:
         self.experiment_name = experiment_name
         self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         
-        # Use fixed "latest" dir if overwriting, otherwise timestamped
-        if overwrite:
-            self.log_dir = Path(log_dir) / experiment_name / "latest"
-            # Clean up old files
-            if self.log_dir.exists():
-                import shutil
-                shutil.rmtree(self.log_dir)
-        else:
-            self.log_dir = Path(log_dir) / experiment_name / self.run_id
+        # Always use timestamped dir, maintain "latest" symlink
+        self.log_dir = Path(log_dir) / experiment_name / self.run_id
+        latest_link = Path(log_dir) / experiment_name / "latest"
+        # Remove old "latest" (symlink or directory from legacy runs)
+        if latest_link.is_symlink():
+            latest_link.unlink()
+        elif latest_link.exists() and overwrite:
+            import shutil
+            shutil.rmtree(latest_link)
+        # Create symlink to current run
+        try:
+            latest_link.symlink_to(self.run_id)
+        except OSError:
+            pass  # Symlinks may not work on all platforms
         
         self.log_dir.mkdir(parents=True, exist_ok=True)
         
