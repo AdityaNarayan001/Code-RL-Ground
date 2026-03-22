@@ -50,6 +50,7 @@ class TrainingStartRequest(BaseModel):
     config_overrides: Optional[Dict[str, Any]] = None
     phased: bool = False
     start_phase: int = 1
+    resume: bool = False
 
 
 class TrainingStatus(BaseModel):
@@ -357,6 +358,7 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
 
         is_phased = request.phased
         start_phase = request.start_phase
+        is_resume = request.resume
 
         # Run training in thread pool to avoid blocking
         def run_training_sync():
@@ -387,6 +389,33 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
                 policy.setup_lora()
                 logger.info("Model loaded successfully!")
                 _append_log({'type': 'info', 'message': 'LoRA ready!'})
+
+                # Handle resume: scan checkpoints and load latest weights
+                if is_resume and is_phased:
+                    checkpoints_dir = Path(state.config.paths.checkpoints)
+                    completed = []
+                    if checkpoints_dir.exists():
+                        for entry in sorted(checkpoints_dir.iterdir()):
+                            if entry.is_dir() and entry.name.startswith("phase_"):
+                                try:
+                                    pnum = int(entry.name.split("_")[1])
+                                except (IndexError, ValueError):
+                                    continue
+                                model_dir = entry / "model"
+                                if model_dir.exists() and model_dir.is_dir():
+                                    completed.append(pnum)
+                    completed.sort()
+                    if completed:
+                        latest_phase = max(completed)
+                        resume_checkpoint = str(checkpoints_dir / f"phase_{latest_phase}" / "model")
+                        start_phase = latest_phase + 1
+                        _append_log({'type': 'info', 'message': f'Resuming from Phase {latest_phase} checkpoint'})
+                        logger.info(f"Resuming from Phase {latest_phase} checkpoint: {resume_checkpoint}")
+                        policy.load_checkpoint(resume_checkpoint)
+                        _append_log({'type': 'info', 'message': f'Loaded checkpoint weights from {resume_checkpoint}'})
+                    else:
+                        _append_log({'type': 'info', 'message': 'No checkpoints found, starting from Phase 1'})
+                        logger.info("Resume requested but no checkpoints found, starting fresh")
 
                 # Set callback for updates
                 def thread_safe_broadcast(data: Dict[str, Any]):
@@ -454,8 +483,18 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
                     # ---- PHASED TRAINING ----
                     from ..environment.phase_env import PhaseOneEnv, PhaseTwoEnv, PhaseThreeEnv
                     from ..data.phase_config import DEFAULT_PHASES, load_phases_from_config
+                    import shutil as _shutil
 
                     PHASES = load_phases_from_config(state.config)
+
+                    # Fresh phased training: clean up old checkpoints
+                    if not is_resume:
+                        old_ckpt_dir = Path(state.config.paths.checkpoints)
+                        if old_ckpt_dir.exists():
+                            for entry in old_ckpt_dir.iterdir():
+                                if entry.is_dir() and entry.name.startswith("phase_"):
+                                    _shutil.rmtree(entry, ignore_errors=True)
+                            _append_log({'type': 'info', 'message': 'Cleared previous phase checkpoints'})
 
                     for phase_num in sorted(PHASES.keys()):
                         if phase_num < start_phase:
@@ -737,33 +776,42 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
 
     @app.get("/api/training/checkpoints")
     async def list_checkpoints():
-        """List available training checkpoints."""
+        """List available phase training checkpoints for resume support."""
         if not state.config:
             raise HTTPException(status_code=500, detail="Config not loaded")
 
         checkpoints_dir = state.config.checkpoints_path
-        if not checkpoints_dir.exists():
-            return {"checkpoints": []}
+        completed_phases: List[int] = []
+        latest_checkpoint: Optional[str] = None
 
-        checkpoints = []
-        for entry in sorted(checkpoints_dir.iterdir()):
-            if entry.is_dir():
-                # Try to extract metadata
-                meta = {"name": entry.name, "path": str(entry)}
-                meta_file = entry / "trainer_state.json"
-                if meta_file.exists():
+        if checkpoints_dir.exists():
+            # Scan for phase_N/model directories
+            for entry in sorted(checkpoints_dir.iterdir()):
+                if entry.is_dir() and entry.name.startswith("phase_"):
                     try:
-                        with open(meta_file) as f:
-                            trainer_state = json.load(f)
-                        meta["step"] = trainer_state.get("global_step")
-                        meta["epoch"] = trainer_state.get("epoch")
-                    except Exception:
-                        pass
-                # Timestamp from directory modification time
-                meta["modified"] = datetime.fromtimestamp(entry.stat().st_mtime).isoformat()
-                checkpoints.append(meta)
+                        phase_num = int(entry.name.split("_")[1])
+                    except (IndexError, ValueError):
+                        continue
+                    model_dir = entry / "model"
+                    if model_dir.exists() and model_dir.is_dir():
+                        # Verify it has adapter files (at minimum adapter_config.json)
+                        has_adapter = (model_dir / "adapter_config.json").exists()
+                        has_model = (model_dir / "adapter_model.safetensors").exists() or (model_dir / "adapter_model.bin").exists()
+                        if has_adapter or has_model:
+                            completed_phases.append(phase_num)
 
-        return {"checkpoints": checkpoints}
+        completed_phases.sort()
+        has_checkpoints = len(completed_phases) > 0
+        resume_phase = (max(completed_phases) + 1) if completed_phases else 1
+        if completed_phases:
+            latest_checkpoint = str(checkpoints_dir / f"phase_{max(completed_phases)}" / "model")
+
+        return {
+            "has_checkpoints": has_checkpoints,
+            "completed_phases": completed_phases,
+            "resume_phase": resume_phase,
+            "latest_checkpoint": latest_checkpoint,
+        }
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):

@@ -1,5 +1,5 @@
-import { Play, Square, Wifi, WifiOff, Clock, Zap, CheckCircle, AlertTriangle, Layers } from 'lucide-react'
-import { TrainingStatus, PRInfo, TrainingMetrics, WSMessage, AdvancedMetrics, PhaseInfo } from '../types'
+import { Play, Square, Wifi, WifiOff, Clock, Zap, CheckCircle, AlertTriangle, Layers, RotateCcw } from 'lucide-react'
+import { TrainingStatus, PRInfo, TrainingMetrics, WSMessage, AdvancedMetrics, PhaseInfo, CheckpointInfo } from '../types'
 import MetricsPanel from './MetricsPanel'
 import RewardChart from './RewardChart'
 import LossChart from './LossChart'
@@ -31,11 +31,13 @@ interface DashboardProps {
   connected: boolean
   onStartTraining: () => void
   onStartPhasedTraining: () => void
+  onResumeTraining: () => void
   onStopTraining: () => void
   advancedMetrics?: AdvancedMetrics | null
   errorMessage?: string | null
   phaseInfo?: PhaseInfo | null
   phaseBanner?: string | null
+  checkpointInfo?: CheckpointInfo | null
 }
 
 function Dashboard({
@@ -47,11 +49,13 @@ function Dashboard({
   connected,
   onStartTraining,
   onStartPhasedTraining,
+  onResumeTraining,
   onStopTraining,
   advancedMetrics,
   errorMessage,
   phaseInfo,
   phaseBanner,
+  checkpointInfo,
 }: DashboardProps) {
   const formatTime = (seconds: number) => {
     const h = Math.floor(seconds / 3600)
@@ -150,6 +154,21 @@ function Dashboard({
                 >
                   <Layers size={16} />
                   Phased Training
+                </button>
+                <button
+                  onClick={onResumeTraining}
+                  disabled={!checkpointInfo?.has_checkpoints}
+                  title={checkpointInfo?.has_checkpoints ? `Resume from Phase ${checkpointInfo.resume_phase}` : 'No checkpoints found'}
+                  className={`flex items-center gap-2 px-4 py-2 rounded-lg transition ${
+                    checkpointInfo?.has_checkpoints
+                      ? 'bg-amber-600 hover:bg-amber-700 text-white'
+                      : 'bg-gray-600 text-gray-400 cursor-not-allowed opacity-50'
+                  }`}
+                >
+                  <RotateCcw size={16} />
+                  {checkpointInfo?.has_checkpoints
+                    ? `Resume (Phase ${checkpointInfo.resume_phase})`
+                    : 'Resume Training'}
                 </button>
               </div>
             )}

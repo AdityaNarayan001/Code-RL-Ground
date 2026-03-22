@@ -12,6 +12,13 @@ export interface PhaseInfo {
   advancement_progress: PhaseAdvancementProgress
 }
 
+export interface CheckpointInfo {
+  has_checkpoints: boolean
+  completed_phases: number[]
+  resume_phase: number
+  latest_checkpoint: string | null
+}
+
 export interface TrainingStatus {
   is_running: boolean
   current_step: number
@@ -22,6 +29,7 @@ export interface TrainingStatus {
   elapsed_time: number
   device: string
   phase?: PhaseInfo
+  checkpoints?: CheckpointInfo
 }
 
 export interface PRInfo {
