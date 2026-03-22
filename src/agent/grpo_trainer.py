@@ -1016,7 +1016,7 @@ class GRPOTrainer:
         Phase-aware: returns different prompts based on the environment type.
         """
         # Check if we're in a phase env that doesn't need tool instructions
-        from ..environment.phase_env import PhaseOneEnv, PhaseTwoEnv
+        from ..environment.phase_env import PhaseOneEnv, PhaseTwoEnv, PhaseThreeEnv
         if isinstance(self.env, PhaseOneEnv):
             return "You are a Python developer. Output ONLY valid Python code. No explanations, no markdown fences, no tool calls."
         if isinstance(self.env, PhaseTwoEnv):
@@ -1027,6 +1027,23 @@ class GRPOTrainer:
 </file>
 
 Output ONLY the <file> block. No explanations, no markdown."""
+
+        if isinstance(self.env, PhaseThreeEnv):
+            return """You are a code assistant. You complete tasks in 2 steps:
+
+Step 1 — Read the file:
+<tool>read_file(path="filename.py")</tool>
+
+Step 2 — Write the complete updated file:
+<file path="filename.py">
+...complete updated file content...
+</file>
+
+Rules:
+1. First read the file to see its current content
+2. Then write the COMPLETE updated file wrapped in <file> tags
+3. Include ALL existing code plus your additions
+4. Do NOT call submit() or write_file()"""
 
         return """You are a code assistant. You solve tasks by calling tools.
 
