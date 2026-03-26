@@ -48,6 +48,7 @@ class RolloutData:
     solved: bool
     group_id: str                     # to group responses from same prompt
     response_text: str                # for display
+    advantage: float = 0.0
 
 
 @dataclass
@@ -784,7 +785,6 @@ class GRPOTrainer:
         
         # Count total items for averaging the accumulated gradients
         num_rollouts = len(rollouts)
-        total_turns_processed = 0
         
         # Stats accumulators (no gradients needed for these)
         total_pg_loss = 0.0
@@ -853,8 +853,6 @@ class GRPOTrainer:
                 scaled_loss.backward()
                 # After backward(), the computation graph from this forward pass
                 # is freed, keeping peak memory = 1 forward pass at a time.
-                
-                total_turns_processed += 1
                 
                 # Accumulate scalar stats (detached, no graph)
                 with torch.no_grad():
@@ -1320,6 +1318,8 @@ Rules:
 
                 episode = self.env.get_episode()
                 reward = episode.total_reward if episode else 0.0
+
+                self.env.cleanup()
 
                 if reward > best_reward:
                     best_reward = reward

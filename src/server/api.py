@@ -367,6 +367,7 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
             from ..data import PRLoader, CurriculumManager
             from ..utils.repo_state import RepoStateManager
 
+            nonlocal start_phase
             loop = asyncio.new_event_loop()
 
             try:
@@ -392,7 +393,7 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
 
                 # Handle resume: scan checkpoints and load latest weights
                 if is_resume and is_phased:
-                    checkpoints_dir = Path(state.config.paths.checkpoints)
+                    checkpoints_dir = state.config.checkpoints_path
                     completed = []
                     if checkpoints_dir.exists():
                         for entry in sorted(checkpoints_dir.iterdir()):
@@ -489,7 +490,7 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
 
                     # Fresh phased training: clean up old checkpoints
                     if not is_resume:
-                        old_ckpt_dir = Path(state.config.paths.checkpoints)
+                        old_ckpt_dir = state.config.checkpoints_path
                         if old_ckpt_dir.exists():
                             for entry in old_ckpt_dir.iterdir():
                                 if entry.is_dir() and entry.name.startswith("phase_"):
@@ -511,7 +512,8 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
                         thread_safe_broadcast({
                             'type': 'phase_change',
                             'phase': phase_num,
-                            'name': PHASES[phase_num].name
+                            'name': PHASES[phase_num].name,
+                            'episode': state.training_stats.get('total_episodes', 0)
                         })
 
                         # Create phase-appropriate environment
@@ -530,67 +532,68 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
                         state.config.environment.max_turns = phase_cfg.max_turns
                         state.config.training.grpo.group_size = phase_cfg.group_size
 
-                        # Get tasks for this phase
-                        if phase_cfg.pr_ids == ["all"]:
-                            tasks = loader.load_in_curriculum_order()
-                        else:
-                            tasks = [loader.load_pr(pr_id) for pr_id in phase_cfg.pr_ids]
+                        try:
+                            # Get tasks for this phase
+                            if phase_cfg.pr_ids == ["all"]:
+                                tasks = loader.load_in_curriculum_order()
+                            else:
+                                tasks = [loader.load_pr(pr_id) for pr_id in phase_cfg.pr_ids]
 
-                        curriculum = CurriculumManager(state.config, loader)
+                            curriculum = CurriculumManager(state.config, loader)
 
-                        trainer = GRPOTrainer(
-                            config=state.config,
-                            policy=policy,
-                            env=env,
-                            pr_tasks=tasks
-                        )
-                        state.trainer = trainer
-                        trainer.set_websocket_callback(thread_safe_broadcast)
+                            trainer = GRPOTrainer(
+                                config=state.config,
+                                policy=policy,
+                                env=env,
+                                pr_tasks=tasks
+                            )
+                            state.trainer = trainer
+                            trainer.set_websocket_callback(thread_safe_broadcast)
 
-                        _append_log({'type': 'info', 'message': f'Phase {phase_num}: Training started (max_turns={phase_cfg.max_turns}, group_size={phase_cfg.group_size})'})
+                            _append_log({'type': 'info', 'message': f'Phase {phase_num}: Training started (max_turns={phase_cfg.max_turns}, group_size={phase_cfg.group_size})'})
 
-                        # Train with advancement checking
-                        max_steps = 500
-                        step = 0
-                        advanced = False
+                            # Train with advancement checking
+                            max_steps = 500
+                            step = 0
+                            advanced = False
 
-                        while step < max_steps and not state.stop_training_flag:
-                            task = tasks[0] if tasks else None
-                            if task is None:
-                                break
-
-                            rollouts = trainer._collect_rollouts(task)
-                            if not rollouts:
-                                continue
-
-                            trainer._compute_advantages(rollouts)
-                            update_stats = trainer._grpo_update(rollouts)
-                            trainer._log_progress(rollouts, update_stats)
-                            step += 1
-
-                            # Check advancement
-                            rewards_in_window = list(state.phase_reward_history)
-                            if len(rewards_in_window) >= phase_cfg.advancement_required:
-                                met = sum(1 for r in rewards_in_window if r >= phase_cfg.advancement_threshold)
-                                if met >= phase_cfg.advancement_required:
-                                    _append_log({'type': 'info', 'message': f'Phase {phase_num} COMPLETE! ({met} of {len(rewards_in_window)} above {phase_cfg.advancement_threshold})'})
-                                    advanced = True
+                            while step < max_steps and not state.stop_training_flag:
+                                task = tasks[0] if tasks else None
+                                if task is None:
                                     break
 
-                        # Save phase checkpoint
-                        checkpoint_dir = Path(state.config.paths.checkpoints) / f"phase_{phase_num}"
-                        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-                        policy.save(str(checkpoint_dir / "model"))
-                        _append_log({'type': 'info', 'message': f'Phase {phase_num} checkpoint saved'})
+                                rollouts = trainer._collect_rollouts(task)
+                                if not rollouts:
+                                    continue
 
-                        # Restore config
-                        state.config.environment.max_turns = orig_max_turns
-                        state.config.training.grpo.group_size = orig_group_size
+                                trainer._compute_advantages(rollouts)
+                                update_stats = trainer._grpo_update(rollouts)
+                                trainer._log_progress(rollouts, update_stats)
+                                step += 1
 
-                        env.cleanup()
+                                # Check advancement
+                                rewards_in_window = list(state.phase_reward_history)
+                                if len(rewards_in_window) >= phase_cfg.advancement_required:
+                                    met = sum(1 for r in rewards_in_window if r >= phase_cfg.advancement_threshold)
+                                    if met >= phase_cfg.advancement_required:
+                                        _append_log({'type': 'info', 'message': f'Phase {phase_num} COMPLETE! ({met} of {len(rewards_in_window)} above {phase_cfg.advancement_threshold})'})
+                                        advanced = True
+                                        break
 
-                        if not advanced and not state.stop_training_flag:
-                            _append_log({'type': 'info', 'message': f'Phase {phase_num}: Max steps reached without advancement, continuing to next phase'})
+                            # Save phase checkpoint
+                            checkpoint_dir = state.config.checkpoints_path / f"phase_{phase_num}"
+                            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                            policy.save(str(checkpoint_dir / "model"))
+                            _append_log({'type': 'info', 'message': f'Phase {phase_num} checkpoint saved'})
+
+                            if not advanced and not state.stop_training_flag:
+                                _append_log({'type': 'info', 'message': f'Phase {phase_num}: Max steps reached without advancement, continuing to next phase'})
+                        finally:
+                            # Restore config
+                            state.config.environment.max_turns = orig_max_turns
+                            state.config.training.grpo.group_size = orig_group_size
+
+                            env.cleanup()
 
                     _append_log({'type': 'training_complete', 'result': {'mode': 'phased', 'final_phase': state.current_phase}})
 

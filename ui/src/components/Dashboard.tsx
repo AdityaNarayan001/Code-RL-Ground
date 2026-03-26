@@ -179,26 +179,26 @@ function Dashboard({
       {/* Advanced metrics bar */}
       {am && (
         <div className="bg-gray-800/50 border-b border-gray-700 px-6 py-2 flex items-center gap-6 text-xs text-gray-400 overflow-x-auto">
-          {am.memory_usage && am.memory_usage.total_mb > 0 && (
+          {am.memory_usage && am.memory_usage.system_total_mb > 0 && (
             <div className="flex items-center gap-2 shrink-0">
               <span>Memory:</span>
               <div className="w-24 h-2 bg-gray-700 rounded-full overflow-hidden">
                 <div
                   className="h-full bg-blue-500 rounded-full transition-all"
-                  style={{ width: `${Math.min(100, (am.memory_usage.used_mb / am.memory_usage.total_mb) * 100)}%` }}
+                  style={{ width: `${Math.min(100, (am.memory_usage.system_used_mb / am.memory_usage.system_total_mb) * 100)}%` }}
                 />
               </div>
               <span className="text-gray-300">
-                {(am.memory_usage.used_mb / 1024).toFixed(1)}/{(am.memory_usage.total_mb / 1024).toFixed(1)} GB
+                {(am.memory_usage.system_used_mb / 1024).toFixed(1)}/{(am.memory_usage.system_total_mb / 1024).toFixed(1)} GB
               </span>
             </div>
           )}
-          {am.curriculum_progress && am.curriculum_progress.total > 0 && (
+          {am.curriculum_progress && (am.curriculum_progress.solved_prs.length > 0 || am.curriculum_progress.current_pr) && (
             <div className="shrink-0">
               <span>Curriculum: </span>
               <span className="text-gray-300">
-                PR {am.curriculum_progress.current}/{am.curriculum_progress.total}
-                {am.curriculum_progress.current_pr_id && ` - ${am.curriculum_progress.current_pr_id}`}
+                {am.curriculum_progress.solved_prs.length} solved
+                {am.curriculum_progress.current_pr && ` - ${am.curriculum_progress.current_pr}`}
               </span>
             </div>
           )}
@@ -208,10 +208,10 @@ function Dashboard({
               <span className="text-gray-300">{am.reward_std.toFixed(4)}</span>
             </div>
           )}
-          {am.step_timing && am.step_timing.avg_ms > 0 && (
+          {am.step_timing && am.step_timing.avg_seconds != null && am.step_timing.avg_seconds > 0 && (
             <div className="shrink-0">
               <span>Avg Step: </span>
-              <span className="text-gray-300">{(am.step_timing.avg_ms / 1000).toFixed(1)}s</span>
+              <span className="text-gray-300">{am.step_timing.avg_seconds.toFixed(1)}s</span>
             </div>
           )}
           {am.policy_entropy !== null && (
