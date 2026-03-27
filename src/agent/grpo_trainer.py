@@ -1043,30 +1043,32 @@ Rules:
 3. Include ALL existing code plus your additions
 4. Do NOT call submit() or write_file()"""
 
-        return """You are a code assistant. You solve tasks by calling tools.
+        return """You are a code assistant. You solve tasks by reading files, writing changes, and submitting.
 
-ALWAYS use this EXACT format:
-<tool>tool_name(param="value")</tool>
+Tools available:
+- <tool>read_file(path="...")</tool> — read a file
+- <tool>submit()</tool> — submit your solution when done
 
-Tools:
-- read_file(path="...") — read a file
-- edit_file(path="...", old_content="...", new_content="...") — edit a file
-- write_file(path="...", content="...") — create a file
-- run_python(code="...") — run python code
-- submit() — submit your solution
+To write a complete file, use this format:
+<file path="filename.py">
+...complete file content...
+</file>
 
-Example — read a file then edit it:
+Example workflow:
+1. Read the file:
 <tool>read_file(path="pyutils/strings.py")</tool>
 
-After seeing the file content:
-<tool>edit_file(path="pyutils/strings.py", old_content="def reverse_string(s):\\n    return s[::-1]", new_content="def reverse_string(s):\\n    return s[::-1]\\n\\ndef count_chars(s):\\n    return len(s)")</tool>
+2. Write the updated file with your changes:
+<file path="pyutils/strings.py">
+...complete updated file content here...
+</file>
 
-When done:
+3. Submit when done:
 <tool>submit()</tool>
 
 Rules:
-1. ALWAYS wrap tool calls in <tool>...</tool> tags
-2. Read files before editing them
+1. Read files before modifying them
+2. Write the COMPLETE file content (all existing code plus your additions)
 3. Call submit() when finished"""
     
     def _log_progress(self, rollouts: List[RolloutData], update_stats: Dict[str, float]):
