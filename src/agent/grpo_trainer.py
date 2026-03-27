@@ -48,6 +48,7 @@ class RolloutData:
     solved: bool
     group_id: str                     # to group responses from same prompt
     response_text: str                # for display
+    advantage: float = 0.0
 
 
 @dataclass
@@ -784,7 +785,6 @@ class GRPOTrainer:
         
         # Count total items for averaging the accumulated gradients
         num_rollouts = len(rollouts)
-        total_turns_processed = 0
         
         # Stats accumulators (no gradients needed for these)
         total_pg_loss = 0.0
@@ -853,8 +853,6 @@ class GRPOTrainer:
                 scaled_loss.backward()
                 # After backward(), the computation graph from this forward pass
                 # is freed, keeping peak memory = 1 forward pass at a time.
-                
-                total_turns_processed += 1
                 
                 # Accumulate scalar stats (detached, no graph)
                 with torch.no_grad():
@@ -1016,7 +1014,7 @@ class GRPOTrainer:
         Phase-aware: returns different prompts based on the environment type.
         """
         # Check if we're in a phase env that doesn't need tool instructions
-        from ..environment.phase_env import PhaseOneEnv, PhaseTwoEnv
+        from ..environment.phase_env import PhaseOneEnv, PhaseTwoEnv, PhaseThreeEnv
         if isinstance(self.env, PhaseOneEnv):
             return "You are a Python developer. Output ONLY valid Python code. No explanations, no markdown fences, no tool calls."
         if isinstance(self.env, PhaseTwoEnv):
@@ -1028,30 +1026,49 @@ class GRPOTrainer:
 
 Output ONLY the <file> block. No explanations, no markdown."""
 
-        return """You are a code assistant. You solve tasks by calling tools.
+        if isinstance(self.env, PhaseThreeEnv):
+            return """You are a code assistant. You complete tasks in 2 steps:
 
-ALWAYS use this EXACT format:
-<tool>tool_name(param="value")</tool>
+Step 1 — Read the file:
+<tool>read_file(path="filename.py")</tool>
 
-Tools:
-- read_file(path="...") — read a file
-- edit_file(path="...", old_content="...", new_content="...") — edit a file
-- write_file(path="...", content="...") — create a file
-- run_python(code="...") — run python code
-- submit() — submit your solution
+Step 2 — Write the complete updated file:
+<file path="filename.py">
+...complete updated file content...
+</file>
 
-Example — read a file then edit it:
+Rules:
+1. First read the file to see its current content
+2. Then write the COMPLETE updated file wrapped in <file> tags
+3. Include ALL existing code plus your additions
+4. Do NOT call submit() or write_file()"""
+
+        return """You are a code assistant. You solve tasks by reading files, writing changes, and submitting.
+
+Tools available:
+- <tool>read_file(path="...")</tool> — read a file
+- <tool>submit()</tool> — submit your solution when done
+
+To write a complete file, use this format:
+<file path="filename.py">
+...complete file content...
+</file>
+
+Example workflow:
+1. Read the file:
 <tool>read_file(path="pyutils/strings.py")</tool>
 
-After seeing the file content:
-<tool>edit_file(path="pyutils/strings.py", old_content="def reverse_string(s):\\n    return s[::-1]", new_content="def reverse_string(s):\\n    return s[::-1]\\n\\ndef count_chars(s):\\n    return len(s)")</tool>
+2. Write the updated file with your changes:
+<file path="pyutils/strings.py">
+...complete updated file content here...
+</file>
 
-When done:
+3. Submit when done:
 <tool>submit()</tool>
 
 Rules:
-1. ALWAYS wrap tool calls in <tool>...</tool> tags
-2. Read files before editing them
+1. Read files before modifying them
+2. Write the COMPLETE file content (all existing code plus your additions)
 3. Call submit() when finished"""
     
     def _log_progress(self, rollouts: List[RolloutData], update_stats: Dict[str, float]):
@@ -1303,6 +1320,8 @@ Rules:
 
                 episode = self.env.get_episode()
                 reward = episode.total_reward if episode else 0.0
+
+                self.env.cleanup()
 
                 if reward > best_reward:
                     best_reward = reward

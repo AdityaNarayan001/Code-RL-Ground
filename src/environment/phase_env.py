@@ -422,14 +422,16 @@ class PhaseTwoEnv:
 class PhaseThreeEnv:
     """Phase 3: Read then write. 2 turns with auto-submit.
 
-    Turn 1: Model should read the target file.
-    Turn 2: Model should write the updated version.
-    After turn 2, submit is forced automatically.
-    A read_bonus of 0.1 is added if the model reads a file on turn 1.
+    Turn 1: <tool>read_file(path="...")</tool> — uses CodeEnv for tool execution
+    Turn 2: <file path="...">...code...</file> — parsed directly (no quote escaping)
+
+    After turn 2, the file content is written and reward is computed.
+    A read_bonus of 0.1 is added if turn 1 is a valid read_file call.
     """
 
     def __init__(self, config: Config, repo_manager: Optional[RepoStateManager] = None):
         self.config = config
+        self.repo_manager = repo_manager
         self.inner_env = CodeEnv(config=config, repo_state_manager=repo_manager)
 
         # Turn tracking
@@ -438,31 +440,40 @@ class PhaseThreeEnv:
 
         # Expose for trainer access
         self.current_pr_data: Optional[Dict[str, Any]] = None
+        self.current_episode: Optional[Episode] = None
+
+        # Lazy reward function
+        self._reward_fn = None
 
     @property
     def reward_fn(self):
-        """Delegate to inner env's reward function."""
-        return self.inner_env.reward_fn
+        """Lazy load reward function."""
+        if self._reward_fn is None:
+            from ..rewards import RewardFunction
+            self._reward_fn = RewardFunction(self.config)
+        return self._reward_fn
 
     def reset(self, pr_data: Dict[str, Any], dependency_prs: List[str]) -> Observation:
-        """Reset environment for a new episode.
-
-        Args:
-            pr_data: PR task definition
-            dependency_prs: List of dependency PRs (already solved)
-
-        Returns:
-            Initial observation with read-first instruction prepended
-        """
+        """Reset for new episode."""
         self.turn_count = 0
         self.read_bonus = 0.0
         self.current_pr_data = pr_data
 
         obs = self.inner_env.reset(pr_data, dependency_prs)
+        self.current_episode = Episode(
+            pr_id=pr_data['pr_id'],
+            task_description=obs.content,
+        )
 
-        # Prepend instruction to read first
+        files_changed = pr_data.get('files_changed', [])
+        target = files_changed[0] if files_changed else 'the target file'
         obs.content = (
-            "Read the target file first, then write the updated version.\n\n"
+            f"Complete this task in 2 steps:\n"
+            f"Step 1: Read the file with <tool>read_file(path=\"{target}\")</tool>\n"
+            f"Step 2: Write the complete updated file using:\n"
+            f"<file path=\"{target}\">\n"
+            f"...complete updated file content...\n"
+            f"</file>\n\n"
             + obs.content
         )
 
@@ -471,56 +482,158 @@ class PhaseThreeEnv:
     def step(self, action: Action) -> Observation:
         """Process a turn.
 
-        Turn 1: Delegate to inner env, check for read_file, return non-terminal.
-        Turn 2: Delegate to inner env, force submit, add read_bonus.
-
-        Args:
-            action: Action from the model
-
-        Returns:
-            Observation (non-terminal after turn 1, terminal after turn 2)
+        Turn 1: Delegate read_file to inner CodeEnv.
+        Turn 2: Parse <file> tags directly, write to disk, compute reward.
         """
         self.turn_count += 1
 
         if self.turn_count == 1:
-            # Turn 1: expect a read_file call
+            # Turn 1: delegate to inner env for read_file execution
             obs = self.inner_env.step(action)
 
-            # Check if it was a valid read_file call
             if (action.action_type == ActionType.TOOL_CALL
                     and action.tool_name == "read_file"):
                 self.read_bonus = 0.1
 
-            # Force non-terminal so we get a second turn
+            # Append instruction for Turn 2
+            files_changed = self.current_pr_data.get('files_changed', [])
+            target = files_changed[0] if files_changed else 'the file'
+            obs.content += (
+                f"\n\nNow write the complete updated file with your changes:\n"
+                f"<file path=\"{target}\">\n"
+                f"...complete updated file content here...\n"
+                f"</file>"
+            )
+
             obs.is_terminal = False
+            if self.current_episode:
+                self.current_episode.turns.append((action, obs))
             return obs
 
         else:
-            # Turn 2: delegate to inner env
-            obs = self.inner_env.step(action)
+            # Turn 2: parse <file> tags directly (no CodeEnv write_file)
+            raw_text = action.text or action.raw_output or ""
 
-            # Force submit if not already terminal
-            if not obs.is_terminal:
-                obs = self.inner_env._handle_submit()
+            # Extract content from <file path="...">...</file>
+            parsed_content = None
+            parsed_path = None
 
-            # Add read bonus
-            obs.reward += self.read_bonus
-            obs.is_terminal = True
+            # Try <file> tags first
+            path_match = re.search(r'<file\s+path\s*=\s*["\']([^"\']+)["\']', raw_text)
+            if path_match:
+                parsed_path = path_match.group(1)
 
-            # Update episode info
-            if self.inner_env.current_episode:
-                self.inner_env.current_episode.total_reward = obs.reward
+            content_match = re.search(
+                r'<file[^>]*>\s*\n?(.*?)\s*</file>',
+                raw_text, re.DOTALL
+            )
+            if content_match:
+                parsed_content = content_match.group(1)
 
-            obs.info['read_bonus'] = self.read_bonus
+            # Fallback: try <tool>write_file(content="...")</tool>
+            if parsed_content is None:
+                wf_match = re.search(r'<tool>\s*write_file\s*\(', raw_text)
+                if wf_match:
+                    # Use the content parser from tools
+                    inner_match = re.search(r'<tool>(.*?)</tool>', raw_text, re.DOTALL)
+                    if inner_match:
+                        inner = inner_match.group(1)
+                        cm = re.search(r'content\s*=\s*["\']', inner)
+                        if cm:
+                            content = inner[cm.end():]
+                            if content.rstrip().endswith('")') or content.rstrip().endswith("')"):
+                                content = content.rstrip()[:-2]
+                            elif content.endswith('"') or content.endswith("'"):
+                                content = content[:-1]
+                            content = content.replace('\\n', '\n').replace('\\t', '\t').replace('\\"', '"')
+                            parsed_content = content
+                        pm = re.search(r'path\s*=\s*["\']([^"\']+)["\']', inner)
+                        if pm:
+                            parsed_path = pm.group(1)
+
+            # Fallback: markdown fences
+            if parsed_content is None:
+                code_block = re.search(r'```python\s*\n(.*?)```', raw_text, re.DOTALL)
+                if code_block:
+                    parsed_content = code_block.group(1).strip()
+
+            # Fallback: raw Python code
+            if parsed_content is None:
+                stripped = raw_text.strip()
+                if re.match(r'^(?:"""|\#|def |class |import |from )', stripped):
+                    parsed_content = stripped
+
+            # Write to disk and compute reward
+            working_dir = self.inner_env.working_dir
+            files_changed = self.current_pr_data.get('files_changed', [])
+            target_file = parsed_path or (files_changed[0] if files_changed else None)
+
+            if parsed_content and target_file and working_dir:
+                # Strip markdown fences if nested
+                parsed_content = PhaseOneEnv._strip_markdown_fences(parsed_content)
+
+                full_path = working_dir / target_file
+                full_path.parent.mkdir(parents=True, exist_ok=True)
+                full_path.write_text(parsed_content)
+
+                # Compute reward via reward_fn
+                actual_state = self.repo_manager.state_from_directory(
+                    working_dir,
+                    self.inner_env.current_state.applied_prs + [self.current_pr_data['pr_id']]
+                )
+                expected_state = self.repo_manager.get_expected_state_after_pr(
+                    self.current_pr_data['pr_id'],
+                    self.inner_env.current_state.applied_prs
+                )
+
+                reward_result = self.reward_fn.compute(
+                    actual_state=actual_state,
+                    expected_state=expected_state,
+                    pr_data=self.current_pr_data,
+                    working_dir=working_dir,
+                )
+                reward = reward_result.total + self.read_bonus
+                breakdown = reward_result.breakdown
+            else:
+                reward = self.read_bonus
+                breakdown = {}
+
+            if self.current_episode:
+                self.current_episode.total_reward = reward
+                self.current_episode.solved = reward >= self.config.curriculum.solve_threshold
+                self.current_episode.submitted = True
+
+            obs = Observation(
+                content=f"Reward: {reward:.4f}",
+                is_terminal=True,
+                reward=reward,
+                info={
+                    'turn': 2,
+                    'reward_breakdown': breakdown,
+                    'solved': self.current_episode.solved if self.current_episode else False,
+                    'read_bonus': self.read_bonus,
+                    'parsed_path': parsed_path,
+                    'parsed_content_length': len(parsed_content) if parsed_content else 0,
+                }
+            )
+
+            if self.current_episode:
+                self.current_episode.turns.append((action, obs))
+
             return obs
 
     def parse_action(self, text: str) -> Action:
-        """Delegate to inner env."""
-        return self.inner_env.parse_action(text)
+        """Parse action — Turn 1 uses CodeEnv parser, Turn 2 is raw text."""
+        if self.turn_count < 1:
+            # Before Turn 1 or during Turn 1: parse for tool calls
+            return self.inner_env.parse_action(text)
+        else:
+            # Turn 2: raw text (we parse <file> tags in step())
+            return Action(action_type=ActionType.TEXT, raw_output=text, text=text)
 
     def get_episode(self) -> Optional[Episode]:
-        """Delegate to inner env."""
-        return self.inner_env.current_episode
+        """Return current episode."""
+        return self.current_episode
 
     def cleanup(self):
         """Delegate cleanup to inner env."""

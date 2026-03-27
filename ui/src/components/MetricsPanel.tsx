@@ -43,15 +43,16 @@ function MetricsPanel({ avgReward, solvedPRs, totalPRs, step, advancedMetrics, l
 
   // Derive gradient variance and step timing from latest steps if available
   const lastStep = latestSteps && latestSteps.length > 0 ? latestSteps[latestSteps.length - 1] : null
-  const gradientVariance = advancedMetrics?.gradient_stats?.variance ?? lastStep?.gradient_variance ?? null
-  const avgStepMs = advancedMetrics?.step_timing?.avg_ms ?? null
-  const lastStepMs = lastStep?.step_duration_ms ?? advancedMetrics?.step_timing?.last_ms ?? null
+  const gradientMean = advancedMetrics?.gradient_stats?.mean ?? null
+  const avgStepSec = advancedMetrics?.step_timing?.avg_seconds ?? null
+  const lastStepMs = lastStep?.step_duration_ms ?? null
 
   // Episode length
-  const episodeLengthAvg = advancedMetrics?.episode_length_avg ?? null
+  const episodeLengthAvg = advancedMetrics?.episode_length_distribution?.avg_turns ?? null
 
-  // Reward distribution sparkline
-  const rewardDist = advancedMetrics?.reward_distribution ?? []
+  // Reward distribution sparkline (server sends object, extract values)
+  const rewardDistObj = advancedMetrics?.reward_distribution ?? {}
+  const rewardDist = Object.values(rewardDistObj)
 
   return (
     <div className="h-full bg-gray-800 rounded-lg p-4 flex flex-col gap-3 overflow-auto">
@@ -101,18 +102,18 @@ function MetricsPanel({ avgReward, solvedPRs, totalPRs, step, advancedMetrics, l
 
       {/* Extended metrics */}
       <div className="space-y-2 text-xs">
-        {gradientVariance !== null && (
+        {gradientMean !== null && (
           <div className="flex justify-between items-center text-gray-400">
-            <span className="flex items-center gap-1"><Gauge size={12} /> Grad Variance</span>
-            <span className="text-gray-200 font-mono">{gradientVariance.toExponential(2)}</span>
+            <span className="flex items-center gap-1"><Gauge size={12} /> Grad Mean</span>
+            <span className="text-gray-200 font-mono">{gradientMean.toExponential(2)}</span>
           </div>
         )}
-        {(avgStepMs !== null || lastStepMs !== null) && (
+        {(avgStepSec !== null || lastStepMs !== null) && (
           <div className="flex justify-between items-center text-gray-400">
             <span className="flex items-center gap-1"><Timer size={12} /> Step Timing</span>
             <span className="text-gray-200 font-mono">
-              {avgStepMs !== null ? `avg ${(avgStepMs / 1000).toFixed(1)}s` : ''}
-              {avgStepMs !== null && lastStepMs !== null ? ' / ' : ''}
+              {avgStepSec !== null ? `avg ${avgStepSec.toFixed(1)}s` : ''}
+              {avgStepSec !== null && lastStepMs !== null ? ' / ' : ''}
               {lastStepMs !== null ? `last ${(lastStepMs / 1000).toFixed(1)}s` : ''}
             </span>
           </div>

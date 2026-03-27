@@ -317,12 +317,17 @@ assert result == {repr(expected)}, f"Expected {repr(expected)}, got {{result}}"
         return current_funcs[-1][1]
 
     def _extract_all_function_names(self, code_files: Dict[str, str]) -> List[str]:
-        """Extract all public function names from code files."""
+        """Extract all public function names from code files (skipping test files)."""
         import re
 
         func_names = []
         for filepath, content in code_files.items():
             if not filepath.endswith('.py'):
+                continue
+            basename = filepath.split('/')[-1]
+            if basename.startswith('test_') or basename in ('setup.py', '__init__.py'):
+                continue
+            if '/tests/' in filepath or filepath.startswith('tests/'):
                 continue
             for match in re.finditer(r'^def\s+(\w+)\s*\(', content, re.MULTILINE):
                 func_name = match.group(1)

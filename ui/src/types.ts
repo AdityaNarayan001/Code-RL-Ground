@@ -12,6 +12,13 @@ export interface PhaseInfo {
   advancement_progress: PhaseAdvancementProgress
 }
 
+export interface CheckpointInfo {
+  has_checkpoints: boolean
+  completed_phases: number[]
+  resume_phase: number
+  latest_checkpoint: string | null
+}
+
 export interface TrainingStatus {
   is_running: boolean
   current_step: number
@@ -22,6 +29,7 @@ export interface TrainingStatus {
   elapsed_time: number
   device: string
   phase?: PhaseInfo
+  checkpoints?: CheckpointInfo
 }
 
 export interface PRInfo {
@@ -66,12 +74,12 @@ export interface TrainingMetrics {
 export interface AdvancedMetrics {
   policy_entropy: number | null
   reward_std: number | null
-  reward_distribution: number[]
-  curriculum_progress: { current: number; total: number; current_pr_id: string | null }
-  memory_usage: { used_mb: number; total_mb: number }
-  step_timing: { avg_ms: number; last_ms: number }
-  gradient_stats: { variance: number | null; norm: number | null }
-  episode_length_avg: number | null
+  reward_distribution: Record<string, number>
+  curriculum_progress: { solved_prs: string[]; current_pr: string | null; attempts_per_pr: Record<string, number> }
+  memory_usage: { system_total_mb: number; system_used_mb: number; system_percent: number; gpu_allocated_mb?: number; gpu_reserved_mb?: number }
+  step_timing: { avg_seconds?: number; min_seconds?: number; max_seconds?: number }
+  gradient_stats: { mean?: number; max?: number; min?: number }
+  episode_length_distribution: { avg_turns?: number; min_turns?: number; max_turns?: number }
 }
 
 export interface WSMessage {

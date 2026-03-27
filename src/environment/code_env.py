@@ -119,8 +119,10 @@ class CodeEnv:
         # Get repository state with dependencies applied
         self.current_state = self.repo_manager.get_state_for_pr(pr_id, dependency_prs)
         
-        # Create working directory
+        # Create working directory (resolve to absolute for subprocess compatibility)
         self.working_dir = self.repo_manager.create_working_directory(self.current_state)
+        if not self.working_dir.is_absolute():
+            self.working_dir = self.working_dir.resolve()
         
         # Configure tools with working directory
         self.tools.set_working_dir(self.working_dir)
@@ -334,16 +336,23 @@ class CodeEnv:
     
     def parse_action(self, model_output: str) -> Action:
         """Parse model output into an action.
-        
+
+        Supports multiple formats:
+        1. <tool>tool_name(args)</tool> — standard tool call
+        2. <file path="...">...code...</file> — file write (from phased training)
+        3. submit() / <submit> — explicit submit
+
         Args:
             model_output: Raw model output text
-            
+
         Returns:
             Parsed Action
         """
-        # Try to parse tool call
+        import re
+
+        # Try to parse <tool> call first
         tool_call = self.tools.parse_tool_call(model_output)
-        
+
         if tool_call:
             return Action(
                 action_type=ActionType.TOOL_CALL if tool_call['tool'] != 'submit' else ActionType.SUBMIT,
@@ -351,14 +360,26 @@ class CodeEnv:
                 tool_args=tool_call['args'],
                 raw_output=model_output
             )
-        
+
+        # Try to parse <file path="...">...</file> tags (learned in Phases 2-3)
+        file_match = re.search(r'<file\s+path\s*=\s*["\']([^"\']+)["\'][^>]*>\s*\n?(.*?)\s*</file>', model_output, re.DOTALL)
+        if file_match:
+            path = file_match.group(1)
+            content = file_match.group(2)
+            return Action(
+                action_type=ActionType.TOOL_CALL,
+                tool_name='write_file',
+                tool_args={'path': path, 'content': content},
+                raw_output=model_output
+            )
+
         # Check for explicit submit keywords
         if any(kw in model_output.lower() for kw in ['submit()', '<submit>', '[[submit]]']):
             return Action(
                 action_type=ActionType.SUBMIT,
                 raw_output=model_output
             )
-        
+
         # Just text
         return Action(
             action_type=ActionType.TEXT,

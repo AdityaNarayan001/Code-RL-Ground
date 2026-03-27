@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import Dashboard from './components/Dashboard'
-import { TrainingStatus, PRInfo, WSMessage, TrainingMetrics, AdvancedMetrics, PhaseInfo } from './types'
+import { TrainingStatus, PRInfo, WSMessage, TrainingMetrics, AdvancedMetrics, PhaseInfo, CheckpointInfo } from './types'
 
 function App() {
   const [status, setStatus] = useState<TrainingStatus | null>(null)
@@ -13,6 +13,7 @@ function App() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const [phaseInfo, setPhaseInfo] = useState<PhaseInfo | null>(null)
   const [phaseBanner, setPhaseBanner] = useState<string | null>(null)
+  const [checkpointInfo, setCheckpointInfo] = useState<CheckpointInfo | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
   const reconnectDelayRef = useRef(1000)
   const pongTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -56,6 +57,23 @@ function App() {
       setErrorMessage('Failed to fetch training data from server.')
     }
   }, [])
+
+  // Fetch checkpoint info
+  const fetchCheckpointInfo = useCallback(async () => {
+    try {
+      const res = await fetch('/api/training/checkpoints')
+      if (res.ok) {
+        setCheckpointInfo(await res.json())
+      }
+    } catch {
+      // Silently ignore
+    }
+  }, [])
+
+  // Fetch checkpoint info on mount
+  useEffect(() => {
+    fetchCheckpointInfo()
+  }, [fetchCheckpointInfo])
 
   // Fetch advanced metrics
   const fetchAdvancedMetrics = useCallback(async () => {
@@ -168,6 +186,7 @@ function App() {
               setErrorMessage(`Training error: ${data.message || data.error || 'Unknown error'}`)
             }
             fetchData()
+            fetchCheckpointInfo()
             break
           case 'phase_change': {
             const phaseNum = data.phase ?? data.new_phase ?? data.current_phase ?? 0
@@ -278,6 +297,25 @@ function App() {
     }
   }
 
+  const resumeTraining = async () => {
+    try {
+      const res = await fetch('/api/training/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phased: true, resume: true }),
+      })
+      if (res.ok) {
+        fetchData()
+      } else {
+        const body = await res.text()
+        setErrorMessage(`Failed to resume training: ${body}`)
+      }
+    } catch (err) {
+      console.error('Failed to resume training:', err)
+      setErrorMessage('Failed to resume training. Is the server running?')
+    }
+  }
+
   const stopTraining = async () => {
     try {
       const res = await fetch('/api/training/stop', { method: 'POST' })
@@ -304,11 +342,13 @@ function App() {
         connected={connected}
         onStartTraining={startTraining}
         onStartPhasedTraining={startPhasedTraining}
+        onResumeTraining={resumeTraining}
         onStopTraining={stopTraining}
         advancedMetrics={advancedMetrics}
         errorMessage={errorMessage}
         phaseInfo={phaseInfo}
         phaseBanner={phaseBanner}
+        checkpointInfo={checkpointInfo}
       />
     </div>
   )

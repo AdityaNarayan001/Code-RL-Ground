@@ -385,58 +385,6 @@ class LLMPolicy:
         
         thread.join()
     
-    def compute_log_prob(
-        self,
-        prompt: str,
-        response: str,
-        require_grad: bool = False
-    ) -> torch.Tensor:
-        """Compute log probability of response given prompt.
-        
-        Args:
-            prompt: Input prompt
-            response: Generated response
-            require_grad: Whether to track gradients (True for training updates)
-            
-        Returns:
-            Log probability tensor
-        """
-        # Concatenate prompt and response
-        full_text = prompt + response
-        
-        inputs = self.tokenizer(
-            full_text,
-            return_tensors="pt",
-            truncation=True
-        )
-        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
-        
-        prompt_ids = self.tokenizer(prompt, return_tensors="pt")['input_ids']
-        prompt_len = prompt_ids.shape[1]
-        
-        if require_grad:
-            # With gradients for policy update
-            outputs = self.model(**inputs)
-            logits = outputs.logits
-        else:
-            # Without gradients for inference
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-                logits = outputs.logits
-        
-        # Get log probs for response tokens only
-        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-        
-        # Gather log probs for actual tokens
-        response_log_probs = []
-        for i in range(prompt_len, inputs['input_ids'].shape[1] - 1):
-            token_id = inputs['input_ids'][0, i + 1]
-            response_log_probs.append(log_probs[0, i, token_id])
-        
-        if response_log_probs:
-            return torch.stack(response_log_probs)
-        return torch.tensor([0.0], device=self.model.device, requires_grad=require_grad)
-    
     def save(self, path: str):
         """Save model weights.
         
