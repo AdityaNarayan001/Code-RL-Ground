@@ -14,9 +14,9 @@ paths:
 
 # Model Configuration
 model:
-  name: "Qwen/Qwen2.5-0.5B-Instruct"
+  name: "Qwen/Qwen2.5-7B-Instruct-1M"
   backend: "transformers"  # transformers for HuggingFace/PyTorch
-  quantization: "auto"  # auto, 4bit, 8bit, or none (4bit/8bit only on CUDA)
+  quantization: "none"  # auto, 4bit, 8bit, or none (4bit/8bit only on CUDA)
   device: "auto"  # auto, cuda, mps, or cpu
   max_context_length: 8192
   generation:
