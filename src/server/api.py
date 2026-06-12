@@ -19,6 +19,7 @@ import json
 import psutil
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -176,6 +177,12 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
     # Routes
     @app.get("/")
     async def root():
+        # Serve the dashboard if the React build exists; this route would
+        # otherwise shadow the StaticFiles mount for the exact "/" path
+        if state.config:
+            ui_index = state.config.resolve_path("./ui/build") / "index.html"
+            if ui_index.exists():
+                return FileResponse(str(ui_index))
         return {"status": "ok", "message": "Code-RL-Ground API"}
 
     @app.get("/api/config")

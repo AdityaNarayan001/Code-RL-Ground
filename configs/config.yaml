@@ -20,7 +20,11 @@ model:
   device: "auto"  # auto, cuda, mps, or cpu
   max_context_length: 8192
   generation:
-    max_new_tokens: 2048
+    # Sized to the dataset: largest expected change ~340 tokens (PR-010 full
+    # decorators.py); worst-case whole-file write_file with syntax/escaping
+    # overhead ~450. 768 leaves margin (truncated tool calls are unparseable
+    # and poison the reward signal); the old 2048 made rollouts ~5x slower.
+    max_new_tokens: 768
     temperature: 0.7
     top_p: 0.95
     do_sample: true
