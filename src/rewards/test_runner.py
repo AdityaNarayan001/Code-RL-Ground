@@ -1,5 +1,6 @@
 """Test runner for evaluating generated code."""
 
+import platform
 import subprocess
 import sys
 from pathlib import Path
@@ -7,6 +8,14 @@ from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
 import tempfile
 import os
+
+_HAS_RESOURCE = False
+if platform.system() != "Windows":
+    try:
+        import resource
+        _HAS_RESOURCE = True
+    except ImportError:
+        pass
 
 
 @dataclass
@@ -24,13 +33,35 @@ class TestResult:
 class TestRunner:
     """Run tests to evaluate generated code."""
 
-    def __init__(self, timeout: int = 30):
+    # Env vars passed through to test subprocesses. The test code under
+    # evaluation is model-generated — never leak the full parent environment
+    # (API keys, tokens) into it.
+    _ENV_ALLOWLIST = ("PATH", "HOME", "LANG", "PYTHONDONTWRITEBYTECODE")
+
+    def __init__(self, timeout: int = 30, max_memory_mb: int = 512):
         """Initialize test runner.
 
         Args:
             timeout: Maximum time for test execution in seconds
+            max_memory_mb: Memory limit for test subprocesses
         """
         self.timeout = timeout
+        self.max_memory_mb = max_memory_mb
+
+    def _subprocess_env(self, work_dir: Path) -> Dict[str, str]:
+        """Minimal sanitized environment for test subprocesses."""
+        env = {key: os.environ[key] for key in self._ENV_ALLOWLIST if key in os.environ}
+        env['PYTHONPATH'] = str(work_dir)
+        return env
+
+    def _set_resource_limits(self):
+        """preexec_fn: cap memory of the test subprocess."""
+        if _HAS_RESOURCE:
+            try:
+                max_bytes = self.max_memory_mb * 1024 * 1024
+                resource.setrlimit(resource.RLIMIT_AS, (max_bytes, max_bytes))
+            except (ValueError, OSError):
+                pass
 
     def run_test_cases(
         self,
@@ -141,7 +172,9 @@ class TestRunner:
                 text=True,
                 timeout=self.timeout,
                 cwd=str(work_dir),
-                env={**os.environ, 'PYTHONPATH': str(work_dir)}
+                env=self._subprocess_env(work_dir),
+                preexec_fn=self._set_resource_limits if _HAS_RESOURCE else None,
+                start_new_session=True
             )
 
             if result.returncode == 0:
@@ -405,7 +438,9 @@ print("PASS")
                 text=True,
                 timeout=self.timeout * 2,
                 cwd=str(working_dir),
-                env={**os.environ, 'PYTHONPATH': str(working_dir)}
+                env=self._subprocess_env(working_dir),
+                preexec_fn=self._set_resource_limits if _HAS_RESOURCE else None,
+                start_new_session=True
             )
 
             # Parse pytest output

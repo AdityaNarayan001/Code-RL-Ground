@@ -10,20 +10,25 @@ interface RewardChartProps {
 }
 
 function RewardChart({ data, currentStep: _currentStep, phaseInfo: _phaseInfo, logs }: RewardChartProps) {
-  // Calculate moving average
-  const windowSize = 10
-  const chartData = data.map((point, i) => {
-    const start = Math.max(0, i - windowSize + 1)
-    const window = data.slice(start, i + 1)
-    const avg = window.reduce((sum, p) => sum + p.reward, 0) / window.length
+  // Calculate moving average in a single O(n) pass with a running sum
+  const chartData = useMemo(() => {
+    const windowSize = 10
+    let runningSum = 0
+    return data.map((point, i) => {
+      runningSum += point.reward
+      if (i >= windowSize) {
+        runningSum -= data[i - windowSize].reward
+      }
+      const windowLength = Math.min(i + 1, windowSize)
 
-    return {
-      episode: point.episode,
-      reward: point.reward,
-      avgReward: avg,
-      solved: point.solved ? 1 : 0,
-    }
-  })
+      return {
+        episode: point.episode,
+        reward: point.reward,
+        avgReward: runningSum / windowLength,
+        solved: point.solved ? 1 : 0,
+      }
+    })
+  }, [data])
 
   // Detect phase transition episodes from logs
   const phaseTransitions = useMemo(() => {

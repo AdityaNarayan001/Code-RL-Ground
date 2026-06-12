@@ -180,10 +180,17 @@ def configure_from_config(config) -> TrainingLogger:
 def get_logger(name: str = "code_rl_ground") -> TrainingLogger:
     """Get a logger instance.
 
+    Module loggers are namespaced under "code_rl_ground" so they inherit
+    the handlers configured by setup_logging(). Without this, get_logger(
+    __name__) returned loggers like "src.agent.grpo_trainer" that bypassed
+    those handlers entirely (INFO logs were silently dropped).
+
     Args:
         name: Logger name
 
     Returns:
         Logger instance
     """
+    if name != "code_rl_ground" and not name.startswith("code_rl_ground."):
+        name = f"code_rl_ground.{name}"
     return logging.getLogger(name)

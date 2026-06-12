@@ -474,7 +474,17 @@ class ToolRegistry:
         Returns:
             Dictionary with tool name and arguments, or None
         """
-        # Match <tool>...</tool> — grab everything inside, then parse tool name + args
+        # Primary: quote-aware scanner. Handles escaped quotes, literal
+        # newlines, parens and even '</tool>' inside string arguments —
+        # all of which break the regex fallback below.
+        start = text.find('<tool>')
+        if start != -1:
+            parsed = self._scan_tool_call(text[start + len('<tool>'):])
+            if parsed is not None:
+                return parsed
+
+        # Fallback: legacy regex extraction (also covers ```tool blocks
+        # and malformed calls the scanner rejects)
         outer_match = re.search(r'<tool>(.*?)</tool>', text, re.DOTALL)
 
         if not outer_match:
@@ -523,6 +533,118 @@ class ToolRegistry:
                 logger.warning(f"Failed to parse tool arguments '{args_str}': {e}")
 
         return {"tool": tool_name, "args": args}
+
+    @staticmethod
+    def _scan_tool_call(s: str) -> Optional[Dict[str, Any]]:
+        """Scan ``name(key="value", ...)`` with a small state machine.
+
+        Unlike a regex, this respects string boundaries: values may contain
+        commas, parens, newlines, escaped quotes (\\" \\' \\n \\t \\\\) and
+        even '</tool>'. An unescaped quote inside a value is tolerated via a
+        syntax-position heuristic: a quote only closes the string when the
+        next non-space char is ',' or ')'.
+
+        Returns None if the text doesn't parse cleanly (caller falls back
+        to the legacy regex path).
+        """
+        n = len(s)
+
+        def skip_ws(j: int) -> int:
+            while j < n and s[j].isspace():
+                j += 1
+            return j
+
+        i = skip_ws(0)
+        name_match = re.match(r'(\w+)\s*\(', s[i:])
+        if not name_match:
+            return None
+        tool_name = name_match.group(1)
+        i += name_match.end()
+
+        args: Dict[str, Any] = {}
+        while True:
+            i = skip_ws(i)
+            if i >= n:
+                return None  # unterminated call
+            if s[i] == ')':
+                return {"tool": tool_name, "args": args}
+            if s[i] == ',':
+                i += 1
+                continue
+
+            key_match = re.match(r'(\w+)\s*=\s*', s[i:])
+            if not key_match:
+                return None  # not key=value syntax
+            key = key_match.group(1)
+            i += key_match.end()
+
+            if i < n and s[i] in ('"', "'"):
+                quote = s[i]
+                i += 1
+                buf = []
+                closed = False
+                while i < n:
+                    c = s[i]
+                    if c == '\\' and i + 1 < n:
+                        nxt = s[i + 1]
+                        if nxt == 'n':
+                            buf.append('\n')
+                        elif nxt == 't':
+                            buf.append('\t')
+                        elif nxt == '\\':
+                            buf.append('\\')
+                        elif nxt in ('"', "'"):
+                            buf.append(nxt)
+                        else:
+                            buf.append(c)
+                            buf.append(nxt)
+                        i += 2
+                        continue
+                    if c == quote:
+                        j = skip_ws(i + 1)
+                        # A quote closes the string only if syntactically
+                        # plausible: followed by ',' + a new kwarg, or by ')'
+                        # at a believable end of the call. Otherwise treat it
+                        # as an unescaped quote inside the value.
+                        if j >= n:
+                            i += 1
+                            closed = True
+                            break
+                        if s[j] == ',' and re.match(r'\s*\w+\s*=', s[j + 1:]):
+                            i += 1
+                            closed = True
+                            break
+                        if s[j] == ')':
+                            k = j + 1
+                            while k < n and s[k] in (' ', '\t'):
+                                k += 1
+                            if k >= n or s.startswith('</tool>', k) or s[k] == '\n':
+                                i += 1
+                                closed = True
+                                break
+                        # Unescaped quote inside the value — keep it
+                        buf.append(c)
+                        i += 1
+                        continue
+                    buf.append(c)
+                    i += 1
+                if not closed:
+                    return None  # unterminated string
+                args[key] = ''.join(buf)
+            else:
+                # Bare value: read until ',' or ')'
+                j = i
+                while j < n and s[j] not in (',', ')'):
+                    j += 1
+                if j >= n:
+                    return None
+                raw = s[i:j].strip()
+                try:
+                    raw = json.loads(raw)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                args[key] = raw
+                i = j
 
     @staticmethod
     def _parse_content_args(args_str: str, tool_name: str) -> Dict[str, str]:

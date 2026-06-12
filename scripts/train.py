@@ -13,7 +13,6 @@ import argparse
 from src.utils.config import load_config
 from src.utils.logging import setup_logging, get_logger
 from src.data import PRLoader, CurriculumManager
-from src.data.augmentation import DataAugmenter
 from src.environment import CodeEnv
 from src.agent import LLMPolicy, GRPOTrainer
 from src.utils.repo_state import RepoStateManager
@@ -74,19 +73,9 @@ def main():
     ordered_tasks = curriculum.get_remaining_tasks()
     logger.info(f"Curriculum order: {[t.pr_id for t in ordered_tasks]}")
 
-    # Data augmentation — expand training set if enabled
-    if config.augmentation.enabled:
-        augmenter = DataAugmenter(seed=config.augmentation.seed)
-        original_count = len(ordered_tasks)
-        ordered_tasks = augmenter.augment_all(
-            ordered_tasks,
-            strategies=config.augmentation.strategies,
-            multiplier=config.augmentation.multiplier
-        )
-        logger.info(
-            f"Data augmentation: {original_count} → {len(ordered_tasks)} tasks "
-            f"(strategies: {config.augmentation.strategies})"
-        )
+    # NOTE: data augmentation is applied inside GRPOTrainer.train() (shared by
+    # the CLI and server paths). Augmenting here as well would expand the task
+    # list twice (e.g. 10 -> 30 -> 90 tasks).
 
     logger.info("Creating environment...")
     env = CodeEnv(config, repo_manager)

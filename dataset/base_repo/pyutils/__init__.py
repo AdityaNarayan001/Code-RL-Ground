@@ -4,3 +4,6 @@ __version__ = "0.1.0"
 
 from .strings import reverse_string, capitalize_words
 from .numbers import is_prime, factorial
+from .files import read_file, write_file
+from .collections import flatten, unique
+from .validators import is_valid_email

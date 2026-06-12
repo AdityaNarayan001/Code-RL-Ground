@@ -48,8 +48,12 @@ class PRProgress:
             required: Number of successes required within window (M).
 
         Returns:
-            True if at least ``required`` of the last ``window`` attempts were solves.
+            True if at least ``required`` of the last ``window`` attempts were
+            solves. Requires a full window of attempts so that e.g. 3 lucky
+            solves in the first 3 attempts don't count as "3 of the last 5".
         """
+        if len(self.recent_solves) < window:
+            return False
         recent = list(self.recent_solves)[-window:]
         return sum(recent) >= required
 

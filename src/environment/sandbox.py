@@ -69,8 +69,10 @@ class PythonSandbox:
         ]
         self.working_dir = working_dir
 
-        # Allowlist of environment variables to pass to subprocesses
-        self._env_allowlist = ["PATH", "HOME", "LANG", "PYTHONPATH", "PYTHONDONTWRITEBYTECODE"]
+        # Allowlist of environment variables to pass to subprocesses.
+        # PYTHONPATH is deliberately NOT inherited from the parent — the
+        # sandbox sets its own (the working dir) in execute_code.
+        self._env_allowlist = ["PATH", "HOME", "LANG", "PYTHONDONTWRITEBYTECODE"]
 
     def _get_sanitized_env(self, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         """Build a sanitized environment dict using only allowlisted variables."""
@@ -81,6 +83,57 @@ class PythonSandbox:
         if extra:
             env.update(extra)
         return env
+
+    def _find_disallowed_imports(
+        self,
+        code: str,
+        local_modules: Optional[set] = None
+    ) -> list:
+        """AST-scan code for imports outside the allowlist.
+
+        Repo-local modules (files/packages in the working dir) are always
+        allowed, as are relative imports. Returns the sorted list of
+        disallowed root module names ([] if clean or unparseable — syntax
+        errors are left for execution to surface).
+        """
+        import ast
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return []
+
+        allowed = set(self.allowed_imports) | (local_modules or set())
+        disallowed = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    root = alias.name.split('.')[0]
+                    if root not in allowed:
+                        disallowed.add(root)
+            elif isinstance(node, ast.ImportFrom):
+                # Relative imports (level > 0) are repo-local
+                if node.level == 0 and node.module:
+                    root = node.module.split('.')[0]
+                    if root not in allowed:
+                        disallowed.add(root)
+        return sorted(disallowed)
+
+    @staticmethod
+    def _local_module_names(work_dir: Path, extra_files: Optional[Dict[str, str]] = None) -> set:
+        """Module names importable from the working directory."""
+        names = set()
+        try:
+            for entry in work_dir.iterdir():
+                if entry.is_file() and entry.suffix == '.py':
+                    names.add(entry.stem)
+                elif entry.is_dir() and (entry / '__init__.py').exists():
+                    names.add(entry.name)
+        except OSError:
+            pass
+        if extra_files:
+            for filepath in extra_files:
+                names.add(Path(filepath).parts[0].removesuffix('.py'))
+        return names
 
     def _set_resource_limits(self):
         """Set resource limits for child process (memory). Used as preexec_fn."""
@@ -179,6 +232,27 @@ except Exception as e:
                     full_path.parent.mkdir(parents=True, exist_ok=True)
                     full_path.write_text(content)
             
+            # Enforce the import allowlist (repo-local modules are allowed)
+            local_modules = self._local_module_names(work_dir, extra_files)
+            disallowed = self._find_disallowed_imports(code, local_modules)
+            if test_code:
+                disallowed = sorted(set(disallowed) | set(
+                    self._find_disallowed_imports(test_code, local_modules)
+                ))
+            if disallowed:
+                return ExecutionResult(
+                    success=False,
+                    stdout="",
+                    stderr=(
+                        f"ImportError: import of {', '.join(disallowed)} is not allowed "
+                        f"in the sandbox. Allowed: {', '.join(sorted(self.allowed_imports))} "
+                        f"plus repository modules."
+                    ),
+                    return_code=-1,
+                    error_message="Disallowed import",
+                    execution_time=0.0
+                )
+
             # Create the script to execute
             script_path = work_dir / "_sandbox_script.py"
             script_content = self._create_wrapper_script(code, test_code)

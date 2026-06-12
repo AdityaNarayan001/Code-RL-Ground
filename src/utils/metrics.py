@@ -531,6 +531,8 @@ class ExperimentLogger:
         }
         with open(self.log_dir / "milestones.jsonl", 'a') as f:
             f.write(json.dumps(milestone) + '\n')
+            f.flush()
+            os.fsync(f.fileno())
     
     def log_checkpoint(self, path: str, step: int):
         """Log checkpoint save."""

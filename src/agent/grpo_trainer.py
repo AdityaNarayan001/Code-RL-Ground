@@ -44,11 +44,12 @@ class RolloutData:
     """Data from a single rollout (multi-turn episode)."""
     turns: List[TurnData]             # Per-turn prompt/response pairs
     response_mask: torch.Tensor       # (total_response_len,) - 1 for valid tokens
-    reward: float                     # scalar outcome reward
+    reward: float                     # shaped reward (task + format warm-up), used for advantages
     solved: bool
     group_id: str                     # to group responses from same prompt
     response_text: str                # for display
     advantage: float = 0.0
+    task_reward: float = 0.0          # unshaped task reward, used for solve/progression checks
 
 
 @dataclass
@@ -254,7 +255,21 @@ class GRPOTrainer:
                         return {'stats': self.stats.to_dict()}
 
                     rollouts = self._collect_rollouts(current_task)
-                    self._compute_advantages(rollouts)
+                    if len(rollouts) < 2:
+                        logger.warning(
+                            f"Only {len(rollouts)}/{self.group_size} rollout(s) collected for "
+                            f"{current_task.pr_id}; skipping update (no group signal)"
+                        )
+                        self.stats.current_pr_idx += 1
+                        continue
+                    has_signal = self._compute_advantages(rollouts)
+                    if not has_signal:
+                        logger.info(
+                            f"All rollout rewards identical for {current_task.pr_id}; "
+                            f"skipping gradient update"
+                        )
+                        self.stats.current_pr_idx += 1
+                        continue
                     try:
                         update_stats = self._grpo_update(rollouts)
                     except RuntimeError as e:
@@ -317,8 +332,27 @@ class GRPOTrainer:
                     # Collect rollouts (group of completions)
                     rollouts = self._collect_rollouts(current_task)
 
+                    # Need >= 2 rollouts for group-relative advantages; episode
+                    # failures can shrink the group. Attempt counters were
+                    # already incremented, so the max_attempts valve still
+                    # protects against an infinite retry loop.
+                    if len(rollouts) < 2:
+                        logger.warning(
+                            f"Only {len(rollouts)}/{self.group_size} rollout(s) collected for "
+                            f"{current_task.pr_id}; retrying (no group signal)"
+                        )
+                        continue
+
                     # Compute group-relative advantages
-                    self._compute_advantages(rollouts)
+                    has_signal = self._compute_advantages(rollouts)
+                    if not has_signal:
+                        # All rewards identical (common early on) — gradient
+                        # would be exactly zero, so skip the expensive update.
+                        logger.info(
+                            f"All rollout rewards identical for {current_task.pr_id}; "
+                            f"skipping gradient update"
+                        )
+                        continue
 
                     # GRPO policy update (with OOM guard)
                     try:
@@ -438,11 +472,18 @@ class GRPOTrainer:
                 )
                 all_prompts.append(current_prompt)
                 
-                # Generate response
+                # Generate response.
+                # Note: we do NOT use generation-time log probs (output.log_probs):
+                # those come from post-processed sampling scores (temperature,
+                # top-k/top-p filtering, renormalisation), which is a different
+                # distribution from the raw model log-softmax used in the GRPO
+                # update. old_log_probs are recomputed below with the exact same
+                # method and context as the update's new_log_probs, so the
+                # importance ratio is exactly 1.0 before the first optimizer step.
                 output = self.policy.generate(
                     current_prompt,
                     system_prompt=system_prompt if turn == 1 else None,
-                    return_log_probs=True,
+                    return_log_probs=False,
                     temperature=temperature
                 )
                 
@@ -457,20 +498,18 @@ class GRPOTrainer:
                 
                 # Collect tokens and log probs for this turn
                 response_ids = torch.tensor(output.token_ids, device=self.device)
-                
-                # Get the prompt_ids for this specific turn
-                turn_prompt_ids = self.policy.tokenizer(
-                    current_prompt, return_tensors="pt", truncation=True
-                )['input_ids'][0]
-                
-                # Get log probs for this turn's tokens
-                if output.log_probs is not None:
-                    if len(output.log_probs.shape) > 1:
-                        lp = self._gather_token_log_probs(output.log_probs, response_ids)
-                    else:
-                        lp = output.log_probs
-                else:
-                    lp = self._compute_token_log_probs(turn_prompt_ids, response_ids)
+
+                # Use the EXACT input ids that generation saw (chat template
+                # applied + truncation), not a re-tokenisation of the raw
+                # prompt — otherwise old/new log probs are computed over
+                # different contexts and the importance ratio is garbage.
+                turn_prompt_ids = torch.tensor(
+                    output.prompt_token_ids, device=self.device
+                )
+
+                # Recompute old log probs under the raw model distribution,
+                # matching _compute_token_log_probs_with_grad in the update.
+                lp = self._compute_token_log_probs(turn_prompt_ids, response_ids)
                 
                 # Store per-turn data (prompt + response + log probs)
                 turn_data_list.append(TurnData(
@@ -590,7 +629,8 @@ class GRPOTrainer:
                 reward=reward,
                 solved=solved,
                 group_id=group_id,
-                response_text="\n---\n".join([h['content'] for h in conversation_history if h['role'] == 'assistant'])
+                response_text="\n---\n".join([h['content'] for h in conversation_history if h['role'] == 'assistant']),
+                task_reward=task_reward
             ))
             
             # Update stats
@@ -602,8 +642,10 @@ class GRPOTrainer:
                 self.stats.attempts_per_pr[task.pr_id] = 0
             self.stats.attempts_per_pr[task.pr_id] += 1
             
-            if reward > self.stats.best_rewards.get(task.pr_id, 0):
-                self.stats.best_rewards[task.pr_id] = reward
+            # Track best TASK reward (excluding format shaping) so the solve
+            # threshold can't be crossed by warm-up shaping alone
+            if task_reward > self.stats.best_rewards.get(task.pr_id, 0):
+                self.stats.best_rewards[task.pr_id] = task_reward
             
             # Track consecutive solves
             if solved:
@@ -746,31 +788,58 @@ class GRPOTrainer:
             return torch.stack(response_log_probs)
         return torch.zeros(1, device=self.device)
     
-    def _compute_advantages(self, rollouts: List[RolloutData]) -> None:
+    def _compute_advantages(self, rollouts: List[RolloutData]) -> bool:
         """Compute group-relative advantages (in-place).
-        
+
         Following TinyZero: normalize rewards within each group,
         then spread the advantage to all tokens in the response.
+
+        Returns:
+            True if at least one group produced a non-zero advantage
+            (i.e. there is a learning signal worth doing an update for).
         """
         # Group rollouts by group_id
         groups = defaultdict(list)
         for rollout in rollouts:
             groups[rollout.group_id].append(rollout)
-        
+
+        has_signal = False
+
         # For each group, compute normalized advantages
         for group_id, group_rollouts in groups.items():
             rewards = torch.tensor([r.reward for r in group_rollouts], device=self.device)
-            
-            # Normalize within group
+
+            # A group needs >= 2 rollouts and reward variance to carry signal.
+            # (torch.std on a single element is NaN; equal rewards give 0/eps.)
+            if len(group_rollouts) < 2:
+                logger.warning(
+                    f"Group {group_id[:8]} has only {len(group_rollouts)} rollout(s); "
+                    f"zeroing advantages (no relative signal)"
+                )
+                for rollout in group_rollouts:
+                    rollout.advantage = 0.0
+                continue
+
+            # Normalize within group (population std: n in denominator)
             mean_reward = rewards.mean()
-            std_reward = rewards.std() + 1e-8
-            normalized = (rewards - mean_reward) / std_reward
-            
+            std_reward = rewards.std(unbiased=False)
+
+            if std_reward.item() < 1e-6:
+                # All rewards identical — no relative signal in this group
+                for rollout in group_rollouts:
+                    rollout.advantage = 0.0
+                continue
+
+            normalized = (rewards - mean_reward) / (std_reward + 1e-8)
+            has_signal = True
+
             # Assign advantage to each rollout
             # Store as attribute (will be used in update)
             for i, rollout in enumerate(group_rollouts):
                 # Spread scalar advantage to all response tokens
                 rollout.advantage = normalized[i].item()
+
+        return has_signal
     
     def _grpo_update(self, rollouts: List[RolloutData]) -> Dict[str, float]:
         """Perform GRPO policy update using token-level computation.
@@ -1073,6 +1142,17 @@ Rules:
     
     def _log_progress(self, rollouts: List[RolloutData], update_stats: Dict[str, float]):
         """Log training progress using sophisticated logger."""
+        # Always emit a console-visible step summary (CLI runs have no
+        # exp_logger/websocket, so this is their only step-level signal)
+        logger.info(
+            f"Step {self.stats.total_steps}: loss={update_stats['loss']:.4f} "
+            f"pg={update_stats['pg_loss']:.4f} kl={update_stats['kl_loss']:.4f} "
+            f"ratio={update_stats.get('mean_ratio', 1.0):.4f} "
+            f"grad_norm={update_stats.get('grad_norm', 0):.3f} "
+            f"reward={update_stats['mean_reward']:.3f} "
+            f"solve_rate={update_stats['solve_rate']:.2f}"
+        )
+
         # Use experiment logger if available
         if self.exp_logger:
             self.exp_logger.log_step(
@@ -1233,7 +1313,21 @@ Rules:
             # Maybe the path itself IS the model dir
             self.policy.load_checkpoint(str(ckpt))
             logger.info(f"Restored model from {ckpt}")
-        
+
+        # Loading the adapter creates new parameter tensors, so the optimizer
+        # and scheduler built in __init__ now reference dead parameters.
+        # Rebuild them BEFORE restoring their state dicts.
+        self.optimizer = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, self.policy.model.parameters()),
+            lr=self.learning_rate
+        )
+        estimated_total_steps = max(self.train_config.max_episodes // self.group_size, 500)
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer,
+            T_max=estimated_total_steps - self.warmup_steps,
+            eta_min=self.learning_rate * 0.1
+        )
+
         # Restore training stats
         stats_path = ckpt / "stats.json"
         if stats_path.exists():

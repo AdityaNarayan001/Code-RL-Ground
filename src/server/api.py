@@ -47,7 +47,6 @@ logger = get_logger(__name__)
 
 # Request/Response models
 class TrainingStartRequest(BaseModel):
-    config_overrides: Optional[Dict[str, Any]] = None
     phased: bool = False
     start_phase: int = 1
     resume: bool = False
@@ -65,6 +64,7 @@ class TrainingStatus(BaseModel):
     current_phase: int = 0
     phase_name: str = ""
     phase_progress: Optional[Dict[str, Any]] = None
+    is_stopping: bool = False
 
 
 class PRInfo(BaseModel):
@@ -108,6 +108,12 @@ class ServerState:
         self.current_phase: int = 0  # 0 = regular, 1-5 = phased
         self.phase_name: str = ""
         self.phase_reward_history: collections.deque = collections.deque(maxlen=10)
+        # Coarse lock guarding multi-field state snapshots and mutations
+        self.lock = threading.RLock()
+        # Monotonic sequence number for log entries (for broadcast tracking)
+        self.log_seq: int = 0
+        # Lazily loaded phase config cache (invalidated when training starts)
+        self.phases_cache: Optional[Dict[int, Any]] = None
 
 
 state = ServerState()
@@ -144,25 +150,20 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
     else:
         state.config = load_config()
 
-    # Track last broadcast index for log polling
-    last_broadcast_idx = [0]
+    # Track last broadcast log sequence number for log polling
+    last_broadcast_seq = [0]
 
     # Background task to poll logs and broadcast to WebSocket clients
     async def log_broadcaster():
         """Poll logs from training thread and broadcast to clients."""
         while True:
             try:
-                current_len = len(state.recent_logs)
-                if current_len > last_broadcast_idx[0]:
-                    # With deque, convert to list for safe slicing
-                    logs_snapshot = list(state.recent_logs)
-                    new_logs = logs_snapshot[last_broadcast_idx[0]:current_len]
-                    for log in new_logs:
+                logs_snapshot = list(state.recent_logs)
+                for log in logs_snapshot:
+                    seq = log.get('_seq', 0)
+                    if seq > last_broadcast_seq[0]:
                         await ws_manager.broadcast(log)
-                    last_broadcast_idx[0] = current_len
-                # Reset index if deque has wrapped around
-                if last_broadcast_idx[0] > current_len:
-                    last_broadcast_idx[0] = 0
+                        last_broadcast_seq[0] = seq
             except Exception as e:
                 logger.error(f"Broadcast error: {e}")
             await asyncio.sleep(0.1)  # Poll every 100ms
@@ -219,15 +220,31 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
         else:
             device = "CPU"
 
+        # Take a consistent snapshot of mutable state
+        with state.lock:
+            is_running = state.is_training
+            stop_flag = state.stop_training_flag
+            stats = dict(state.training_stats)
+            current_phase = state.current_phase
+            phase_name = state.phase_name
+            rewards_list = list(state.phase_reward_history)
+
+        # Stopping = stop requested but the training thread is still winding down
+        is_stopping = bool(
+            stop_flag and is_running
+            and state.training_thread is not None
+            and state.training_thread.is_alive()
+        )
+
         # Build phase progress info
         phase_progress = None
-        if state.current_phase > 0:
-            rewards_list = list(state.phase_reward_history)
-            # Import phase config for threshold info
+        if current_phase > 0:
+            # Lazily load and cache phase config (invalidated on training start)
             try:
-                from ..data.phase_config import load_phases_from_config
-                phases = load_phases_from_config(state.config)
-                pcfg = phases.get(state.current_phase)
+                if state.phases_cache is None:
+                    from ..data.phase_config import load_phases_from_config
+                    state.phases_cache = load_phases_from_config(state.config)
+                pcfg = state.phases_cache.get(current_phase)
                 if pcfg:
                     met = sum(1 for r in rewards_list if r >= pcfg.advancement_threshold)
                     phase_progress = {
@@ -241,17 +258,18 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
                 pass
 
         return TrainingStatus(
-            is_running=state.is_training,
-            current_step=state.training_stats.get('total_steps', 0),
-            current_episode=state.training_stats.get('total_episodes', 0),
-            current_pr=state.training_stats.get('current_pr_id'),
-            solved_prs=state.training_stats.get('solved_prs', []),
-            avg_reward=_sanitize_floats(state.training_stats.get('avg_reward', 0.0)),
+            is_running=is_running,
+            current_step=stats.get('total_steps', 0),
+            current_episode=stats.get('total_episodes', 0),
+            current_pr=stats.get('current_pr_id'),
+            solved_prs=stats.get('solved_prs', []),
+            avg_reward=_sanitize_floats(stats.get('avg_reward', 0.0)),
             elapsed_time=elapsed,
             device=device,
-            current_phase=state.current_phase,
-            phase_name=state.phase_name,
-            phase_progress=phase_progress
+            current_phase=current_phase,
+            phase_name=phase_name,
+            phase_progress=phase_progress,
+            is_stopping=is_stopping
         )
 
     @app.get("/api/prs")
@@ -262,14 +280,16 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
         loader = PRLoader(state.config.dataset_path)
         tasks = loader.load_all()
 
-        solved = state.training_stats.get('solved_prs', [])
-        best_rewards = state.training_stats.get('best_rewards', {})
-        attempts_per_pr = state.training_stats.get('attempts_per_pr', {})
+        with state.lock:
+            solved = list(state.training_stats.get('solved_prs', []))
+            best_rewards = dict(state.training_stats.get('best_rewards', {}))
+            attempts_per_pr = dict(state.training_stats.get('attempts_per_pr', {}))
+            current_pr_id = state.training_stats.get('current_pr_id')
 
         result = []
         for task in tasks:
             status = "solved" if task.pr_id in solved else (
-                "in_progress" if task.pr_id == state.training_stats.get('current_pr_id') else "pending"
+                "in_progress" if task.pr_id == current_pr_id else "pending"
             )
             result.append(PRInfo(
                 pr_id=task.pr_id,
@@ -343,18 +363,21 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
                 detail="batch_size must be positive"
             )
 
-        state.is_training = True
-        state.start_time = datetime.now()
-        state.training_stats = {}
-        state.stop_training_flag = False
-        # Reset incremental average trackers
-        state._reward_sum = 0.0
-        state._reward_count = 0
-        state.recent_rewards.clear()
-        state._step_times.clear()
-        state._last_step_time = None
-        state._recent_grad_norms.clear()
-        state._episode_lengths.clear()
+        with state.lock:
+            state.is_training = True
+            state.start_time = datetime.now()
+            state.training_stats = {}
+            state.stop_training_flag = False
+            # Invalidate cached phase config so it is reloaded for this run
+            state.phases_cache = None
+            # Reset incremental average trackers
+            state._reward_sum = 0.0
+            state._reward_count = 0
+            state.recent_rewards.clear()
+            state._step_times.clear()
+            state._last_step_time = None
+            state._recent_grad_norms.clear()
+            state._episode_lengths.clear()
 
         is_phased = request.phased
         start_phase = request.start_phase
@@ -422,63 +445,64 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
                 def thread_safe_broadcast(data: Dict[str, Any]):
                     _append_log(data)
 
-                    # Update training stats from broadcasts
-                    if data.get('type') == 'step':
-                        now = time.time()
-                        if state._last_step_time is not None:
-                            state._step_times.append(now - state._last_step_time)
-                        state._last_step_time = now
+                    # Update training stats from broadcasts (under lock for consistent snapshots)
+                    with state.lock:
+                        if data.get('type') == 'step':
+                            now = time.time()
+                            if state._last_step_time is not None:
+                                state._step_times.append(now - state._last_step_time)
+                            state._last_step_time = now
 
-                        metrics = data.get('metrics', {})
-                        state.training_stats['total_steps'] = data.get('step', 0)
-                        state.training_stats['solve_rate'] = metrics.get('solve_rate', 0)
-                        if state._reward_count == 0:
-                            state.training_stats['avg_reward'] = metrics.get(
-                                'avg_reward', metrics.get('mean_reward', 0)
-                            )
-                        grad_norm = metrics.get('grad_norm')
-                        if grad_norm is not None:
-                            state._recent_grad_norms.append(grad_norm)
+                            metrics = data.get('metrics', {})
+                            state.training_stats['total_steps'] = data.get('step', 0)
+                            state.training_stats['solve_rate'] = metrics.get('solve_rate', 0)
+                            if state._reward_count == 0:
+                                state.training_stats['avg_reward'] = metrics.get(
+                                    'avg_reward', metrics.get('mean_reward', 0)
+                                )
+                            grad_norm = metrics.get('grad_norm')
+                            if grad_norm is not None:
+                                state._recent_grad_norms.append(grad_norm)
 
-                    elif data.get('type') == 'episode':
-                        state.training_stats['total_episodes'] = data.get('episode', 0)
-                        state.training_stats['current_pr_id'] = data.get('pr_id')
-
-                        reward = data.get('reward', 0)
-                        state._reward_count += 1
-                        state._reward_sum += reward
-                        state.training_stats['avg_reward'] = state._reward_sum / state._reward_count
-                        state.recent_rewards.append(reward)
-                        state.phase_reward_history.append(reward)
-
-                        ep_len = data.get('turns', data.get('length'))
-                        if ep_len is not None:
-                            state._episode_lengths.append(ep_len)
-
-                        pr_id = data.get('pr_id')
-                        if pr_id:
-                            best_rewards = state.training_stats.setdefault('best_rewards', {})
-                            if reward > best_rewards.get(pr_id, float('-inf')):
-                                best_rewards[pr_id] = reward
-                            attempts = state.training_stats.setdefault('attempts_per_pr', {})
-                            attempts[pr_id] = attempts.get(pr_id, 0) + 1
-
-                    elif data.get('type') == 'phase_change':
-                        state.current_phase = data.get('phase', 0)
-                        state.phase_name = data.get('name', '')
-                        state.phase_reward_history.clear()
-
-                    elif data.get('type') == 'generation_token':
-                        if data.get('pr_id'):
+                        elif data.get('type') == 'episode':
+                            state.training_stats['total_episodes'] = data.get('episode', 0)
                             state.training_stats['current_pr_id'] = data.get('pr_id')
-                    elif data.get('type') == 'generation_complete':
-                        state.training_stats['current_group'] = data.get('group_idx', 0)
-                        state.training_stats['current_pr_id'] = data.get('pr_id')
-                    elif data.get('type') == 'pr_solved':
-                        solved = state.training_stats.get('solved_prs', [])
-                        if data.get('pr_id') not in solved:
-                            solved.append(data.get('pr_id'))
-                        state.training_stats['solved_prs'] = solved
+
+                            reward = data.get('reward', 0)
+                            state._reward_count += 1
+                            state._reward_sum += reward
+                            state.training_stats['avg_reward'] = state._reward_sum / state._reward_count
+                            state.recent_rewards.append(reward)
+                            state.phase_reward_history.append(reward)
+
+                            ep_len = data.get('turns', data.get('length'))
+                            if ep_len is not None:
+                                state._episode_lengths.append(ep_len)
+
+                            pr_id = data.get('pr_id')
+                            if pr_id:
+                                best_rewards = state.training_stats.setdefault('best_rewards', {})
+                                if reward > best_rewards.get(pr_id, float('-inf')):
+                                    best_rewards[pr_id] = reward
+                                attempts = state.training_stats.setdefault('attempts_per_pr', {})
+                                attempts[pr_id] = attempts.get(pr_id, 0) + 1
+
+                        elif data.get('type') == 'phase_change':
+                            state.current_phase = data.get('phase', 0)
+                            state.phase_name = data.get('name', '')
+                            state.phase_reward_history.clear()
+
+                        elif data.get('type') == 'generation_token':
+                            if data.get('pr_id'):
+                                state.training_stats['current_pr_id'] = data.get('pr_id')
+                        elif data.get('type') == 'generation_complete':
+                            state.training_stats['current_group'] = data.get('group_idx', 0)
+                            state.training_stats['current_pr_id'] = data.get('pr_id')
+                        elif data.get('type') == 'pr_solved':
+                            solved = state.training_stats.get('solved_prs', [])
+                            if data.get('pr_id') not in solved:
+                                solved.append(data.get('pr_id'))
+                            state.training_stats['solved_prs'] = solved
 
                 if is_phased:
                     # ---- PHASED TRAINING ----
@@ -526,13 +550,14 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
                         else:
                             env = CodeEnv(state.config, repo_manager)
 
-                        # Override config for this phase
+                        # Override config for this phase (restored in finally below)
                         orig_max_turns = state.config.environment.max_turns
                         orig_group_size = state.config.training.grpo.group_size
-                        state.config.environment.max_turns = phase_cfg.max_turns
-                        state.config.training.grpo.group_size = phase_cfg.group_size
 
                         try:
+                            state.config.environment.max_turns = phase_cfg.max_turns
+                            state.config.training.grpo.group_size = phase_cfg.group_size
+
                             # Get tasks for this phase
                             if phase_cfg.pr_ids == ["all"]:
                                 tasks = loader.load_in_curriculum_order()
@@ -616,7 +641,8 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
                     _append_log({'type': 'info', 'message': 'Starting training loop...'})
                     result = trainer.train()
 
-                    state.training_stats = result.get('stats', {})
+                    with state.lock:
+                        state.training_stats = result.get('stats', {})
                     _append_log({'type': 'training_complete', 'result': result})
 
             except Exception as e:
@@ -628,10 +654,12 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
                     'traceback': traceback.format_exc()
                 })
             finally:
-                state.is_training = False
-                state.trainer = None
-                state.current_phase = 0
-                state.phase_name = ""
+                # Single place where is_training is cleared (stop endpoint only sets the flag)
+                with state.lock:
+                    state.is_training = False
+                    state.trainer = None
+                    state.current_phase = 0
+                    state.phase_name = ""
                 loop.close()
 
         # Start in thread pool
@@ -646,15 +674,15 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
         if not state.is_training:
             raise HTTPException(status_code=400, detail="No training in progress")
 
-        state.stop_training_flag = True
+        # Only signal: the training thread's finally block clears is_training
+        with state.lock:
+            state.stop_training_flag = True
 
-        # Signal the trainer to stop gracefully
-        if state.trainer is not None:
-            state.trainer.stop_requested = True
+            # Signal the trainer to stop gracefully
+            if state.trainer is not None:
+                state.trainer.stop_requested = True
 
-        state.is_training = False
-
-        return {"status": "stopped", "message": "Stop signal sent"}
+        return {"status": "stopping", "message": "Stop signal sent; training will halt shortly"}
 
     @app.get("/api/logs")
     async def get_logs(limit: int = 100):
@@ -669,7 +697,10 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
         rewards = []
         steps = []
 
-        for log in list(state.recent_logs):
+        with state.lock:
+            logs_snapshot = list(state.recent_logs)
+
+        for log in logs_snapshot:
             if log.get('type') == 'step':
                 metrics = log.get('metrics', {})
                 steps.append({
@@ -839,9 +870,12 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
 
 
 def _append_log(entry: Dict[str, Any]):
-    """Append a log entry with a timestamp to the recent_logs deque."""
+    """Append a log entry with a timestamp and sequence number to the recent_logs deque."""
     entry.setdefault('timestamp', datetime.now().isoformat())
-    state.recent_logs.append(entry)
+    with state.lock:
+        state.log_seq += 1
+        entry['_seq'] = state.log_seq
+        state.recent_logs.append(entry)
 
 
 def run_server(host: str = None, port: int = None, config_path: str = None):

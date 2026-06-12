@@ -17,7 +17,6 @@
       "test_numbers.py": "Number tests",
       "test_files.py": "File tests"
     },
-    "setup.py": "Package setup",
-    "README.md": "Documentation"
+    "setup.py": "Package setup"
   }
 }

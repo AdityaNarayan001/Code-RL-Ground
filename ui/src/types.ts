@@ -6,6 +6,7 @@ export interface PhaseAdvancementProgress {
   window: number
 }
 
+// UI-side derived type, reconstructed from the flat TrainingStatus fields
 export interface PhaseInfo {
   current_phase: number       // 0=legacy, 1-5
   phase_name: string          // "Code Completion", "Tool Format", etc.
@@ -28,8 +29,11 @@ export interface TrainingStatus {
   avg_reward: number
   elapsed_time: number
   device: string
-  phase?: PhaseInfo
-  checkpoints?: CheckpointInfo
+  // Flat phase fields as sent by the server (/api/status)
+  current_phase?: number
+  phase_name?: string
+  phase_progress?: PhaseAdvancementProgress | null
+  is_stopping?: boolean
 }
 
 export interface PRInfo {

@@ -33,7 +33,7 @@ training:
   
   # GRPO specific (Group Relative Policy Optimization)
   grpo:
-    group_size: 2  # Number of completions per prompt
+    group_size: 4  # Number of completions per prompt (>=4 recommended; <2 gives no group signal)
     beta: 0.1  # KL penalty coefficient
     clip_range: 0.2
     
@@ -120,7 +120,9 @@ curriculum:
 augmentation:
   enabled: true
   strategies:
-    - variable_renaming     # Change variable names (e.g., 's' -> 'text', 'n' -> 'num')
+    # NOTE: variable_renaming is intentionally NOT enabled: it rewrites the
+    # expected_changes (grading target) without changing the PR description the
+    # model sees, making files_match/exact_match unattainable on those variants.
     - docstring_variation   # Rephrase docstrings slightly
     - whitespace_variation  # Minor formatting changes
   multiplier: 3             # 3x more training examples per PR

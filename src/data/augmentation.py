@@ -162,19 +162,25 @@ class DataAugmenter:
         task.data['expected_changes'] = expected_changes
         return task
     
+    # Matches a single- or double-quoted string literal (with escape support)
+    _STRING_LITERAL_RE = re.compile(r'(\'(?:[^\'\\]|\\.)*\'|"(?:[^"\\]|\\.)*")')
+
     def _rename_variables(self, code: str, variant_idx: int) -> str:
-        """Rename variables in a code string."""
-        result = code
+        """Rename variables in a code string, leaving string literals intact."""
+        # Split on string literals: even indices are code, odd are literals
+        parts = self._STRING_LITERAL_RE.split(code)
 
-        for old_var, new_vars in VARIABLE_MAPPINGS.items():
-            if len(new_vars) > variant_idx:
-                new_var = new_vars[variant_idx % len(new_vars)]
-                # Use word boundaries but skip attribute access (self.var, obj.var)
-                # and string literals are handled by only replacing outside quotes
-                pattern = rf'(?<!\.)(?<!\w){re.escape(old_var)}(?!\w)'
-                result = re.sub(pattern, new_var, result)
+        for k in range(0, len(parts), 2):
+            segment = parts[k]
+            for old_var, new_vars in VARIABLE_MAPPINGS.items():
+                if len(new_vars) > variant_idx:
+                    new_var = new_vars[variant_idx % len(new_vars)]
+                    # Word boundaries, but skip attribute access (self.var, obj.var)
+                    pattern = rf'(?<!\.)(?<!\w){re.escape(old_var)}(?!\w)'
+                    segment = re.sub(pattern, new_var, segment)
+            parts[k] = segment
 
-        return result
+        return ''.join(parts)
     
     def _apply_docstring_variation(self, task: PRTask, variant_idx: int) -> PRTask:
         """Apply docstring variation augmentation.

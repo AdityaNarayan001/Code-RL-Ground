@@ -491,8 +491,11 @@ class PhaseThreeEnv:
             # Turn 1: delegate to inner env for read_file execution
             obs = self.inner_env.step(action)
 
+            # Bonus only when the read actually succeeded — otherwise the
+            # model learns to "read" nonexistent paths for free reward
             if (action.action_type == ActionType.TOOL_CALL
-                    and action.tool_name == "read_file"):
+                    and action.tool_name == "read_file"
+                    and (obs.info or {}).get('success', False)):
                 self.read_bonus = 0.1
 
             # Append instruction for Turn 2

@@ -15,6 +15,7 @@ function App() {
   const [phaseBanner, setPhaseBanner] = useState<string | null>(null)
   const [checkpointInfo, setCheckpointInfo] = useState<CheckpointInfo | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
+  const prevPhaseRef = useRef<number | null>(null)
   const reconnectDelayRef = useRef(1000)
   const pongTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -203,11 +204,13 @@ function App() {
               },
             }
             setPhaseInfo(newPhase)
-            if (phaseNum > 1) {
-              setPhaseBanner(`Phase ${phaseNum - 1} Complete! Advancing to Phase ${phaseNum}: ${phaseName}`)
+            const prevPhase = prevPhaseRef.current
+            if (prevPhase !== null && prevPhase < phaseNum) {
+              setPhaseBanner(`Phase ${prevPhase} Complete! Advancing to Phase ${phaseNum}: ${phaseName}`)
             } else {
               setPhaseBanner(`Starting Phase ${phaseNum}: ${phaseName}`)
             }
+            prevPhaseRef.current = phaseNum
             fetchData()
             break
           }

@@ -50,6 +50,9 @@ class GenerationOutput:
     token_ids: List[int]
     log_probs: Optional[torch.Tensor] = None
     finished: bool = True
+    # Exact input ids fed to the model (after chat template + truncation).
+    # Needed so RL log-prob recomputation uses the same context as generation.
+    prompt_token_ids: Optional[List[int]] = None
 
 
 class LLMPolicy:
@@ -311,7 +314,8 @@ class LLMPolicy:
             text=generated_text,
             token_ids=generated_ids.tolist(),
             log_probs=log_probs,
-            finished=True
+            finished=True,
+            prompt_token_ids=inputs['input_ids'][0].tolist()
         )
     
     def generate_streaming(
@@ -418,12 +422,20 @@ class LLMPolicy:
         
         # Load LoRA weights
         if isinstance(self.model, PeftModel):
-            self.model.load_adapter(checkpoint_path, adapter_name="default")
+            # load_adapter() raises if "default" already exists, so replace it.
+            # This creates new parameter tensors — callers holding optimizer
+            # references (e.g. GRPOTrainer) must rebuild their optimizer after
+            # calling this.
+            if "default" in getattr(self.model, "peft_config", {}):
+                self.model.delete_adapter("default")
+            self.model.load_adapter(str(checkpoint_path), adapter_name="default")
+            self.model.set_adapter("default")
         else:
             # Load full model
             self.model = PeftModel.from_pretrained(
                 self.model,
-                checkpoint_path
+                checkpoint_path,
+                is_trainable=True
             )
         
         logger.info(f"Loaded checkpoint from {checkpoint_path}")

@@ -12,7 +12,7 @@ class ModelConfig:
     name: str = "Qwen/Qwen2.5-3B"
     backend: str = "transformers"
     quantization: str = "4bit"
-    device: str = "mps"
+    device: str = "auto"
     max_context_length: int = 8192
     generation: Dict[str, Any] = field(default_factory=lambda: {
         "max_new_tokens": 2048,
